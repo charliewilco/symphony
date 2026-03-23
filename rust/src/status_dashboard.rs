@@ -650,6 +650,7 @@ fn sanitize_line(value: &str) -> String {
         .join(" ")
 }
 
+#[allow(clippy::while_let_on_iterator)]
 fn strip_ansi_escape_sequences(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
@@ -674,11 +675,9 @@ fn strip_ansi_escape_sequences(value: &str) -> String {
                     if next == '\u{07}' {
                         break;
                     }
-                    if next == '\u{1b}' {
-                        if matches!(chars.peek().copied(), Some('\\')) {
-                            let _ = chars.next();
-                            break;
-                        }
+                    if next == '\u{1b}' && matches!(chars.peek().copied(), Some('\\')) {
+                        let _ = chars.next();
+                        break;
                     }
                 }
             }
