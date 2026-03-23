@@ -352,6 +352,9 @@ impl Settings {
         if self.agent.max_turns == 0 {
             bail!("agent.max_turns must be > 0");
         }
+        if self.codex.command.is_empty() {
+            bail!("codex.command must be present and non-empty");
+        }
         if self.codex.turn_timeout_ms == 0 {
             bail!("codex.turn_timeout_ms must be > 0");
         }
@@ -600,5 +603,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.max_concurrent_agents_for_state("in progress"), 2);
+    }
+
+    #[test]
+    fn rejects_empty_codex_command() {
+        let err = Settings::from_workflow(
+            &config_value("tracker:\n  kind: memory\ncodex:\n  command: \"\"\n"),
+            &CliOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("codex.command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_whitespace_codex_command() {
+        // Matches Elixir: validate_required only rejects empty string, not whitespace.
+        let settings = Settings::from_workflow(
+            &config_value("tracker:\n  kind: memory\ncodex:\n  command: \"   \"\n"),
+            &CliOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(settings.codex.command, "   ");
     }
 }
