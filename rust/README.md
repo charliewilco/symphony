@@ -64,6 +64,9 @@ You can also use the local task runner:
 just run ./WORKFLOW.md
 ```
 
+The terminal dashboard renders automatically in a local TTY by default. Start the
+web dashboard explicitly with `--port` when you want the browser UI.
+
 ## Install
 
 Install `rsymphony` into Cargo's global bin directory:
@@ -95,7 +98,8 @@ Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory
   (default: `./log`)
-- `--port` also starts the observability service (default: disabled)
+- `--port` also enables the web dashboard and API endpoints on that port
+  (terminal observability remains on by default when attached to a TTY)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown
 body used as the Codex session prompt.

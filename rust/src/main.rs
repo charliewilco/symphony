@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -5,7 +6,7 @@ use clap::Parser;
 use rsymphony::config::{CliOverrides, Settings};
 use rsymphony::http;
 use rsymphony::log_file;
-use rsymphony::orchestrator::OrchestratorRuntime;
+use rsymphony::orchestrator::{OrchestratorHandle, OrchestratorRuntime, Snapshot};
 use rsymphony::workflow::{load, workflow_file_path};
 use rsymphony::workflow_store::WorkflowStore;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +62,11 @@ async fn run() -> Result<()> {
     workflow_store.spawn_reload_task();
     let orchestrator =
         OrchestratorRuntime::start(workflow_store.clone(), overrides.clone()).await?;
+    tokio::spawn(run_terminal_dashboard(
+        orchestrator.clone(),
+        workflow_store.clone(),
+        overrides.clone(),
+    ));
 
     if let Some(port) = Settings::from_workflow(&workflow_store.current().await, &overrides)?
         .server
@@ -76,6 +82,129 @@ async fn run() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+async fn run_terminal_dashboard(
+    orchestrator: OrchestratorHandle,
+    workflow_store: WorkflowStore,
+    overrides: CliOverrides,
+) {
+    let mut stdout = io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
+
+    let mut last_rendered_content = None;
+    let mut last_rendered_ms = None;
+    let mut last_token_snapshot: Option<u64> = None;
+    let mut token_samples: Vec<(u64, u64)> = Vec::new();
+
+    loop {
+        let (settings, refresh_ms, render_interval_ms) =
+            match Settings::from_workflow(&workflow_store.current().await, &overrides) {
+                Ok(settings) => {
+                    let refresh_ms = settings.observability.refresh_ms;
+                    let render_interval_ms = settings.observability.render_interval_ms;
+                    (settings, refresh_ms, render_interval_ms)
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+                    continue;
+                }
+            };
+
+        if !settings.observability.dashboard_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(refresh_ms.max(1))).await;
+            continue;
+        }
+
+        let now_ms = now_millis();
+        let snapshot = orchestrator.snapshot().await;
+        let (total_tokens, snapshot): (u64, Option<Snapshot>) = match snapshot {
+            Ok(snapshot) => {
+                let total_tokens = snapshot.codex_totals.total_tokens;
+                last_token_snapshot = Some(total_tokens);
+                (total_tokens, Some(snapshot))
+            }
+            Err(_) => (last_token_snapshot.unwrap_or(0), None),
+        };
+
+        let tps = rolling_tps(&mut token_samples, now_ms, total_tokens);
+        let content = rsymphony::status_dashboard::format_snapshot_content_for_test(
+            snapshot.as_ref(),
+            &settings,
+            tps,
+            Some(terminal_columns()),
+        );
+
+        let content_changed = last_rendered_content.as_deref() != Some(content.as_str());
+        let should_render = should_render_content(
+            last_rendered_ms,
+            now_ms,
+            render_interval_ms,
+            content_changed,
+        );
+
+        if should_render {
+            let _ = write!(stdout, "\x1b[2J\x1b[H");
+            let _ = write!(stdout, "{content}");
+            let _ = stdout.write_all(b"\n");
+            let _ = stdout.flush();
+            last_rendered_ms = Some(now_ms);
+            last_rendered_content = Some(content);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(refresh_ms.max(1))).await;
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn should_render_content(
+    last_rendered_ms: Option<u64>,
+    now_ms: u64,
+    render_interval_ms: u64,
+    content_changed: bool,
+) -> bool {
+    match last_rendered_ms {
+        None => true,
+        Some(last) => content_changed || now_ms.saturating_sub(last) >= render_interval_ms.max(16),
+    }
+}
+
+fn rolling_tps(samples: &mut Vec<(u64, u64)>, now_ms: u64, total_tokens: u64) -> f64 {
+    const TPS_WINDOW_MS: u64 = 5_000;
+    let window_start = now_ms.saturating_sub(TPS_WINDOW_MS);
+    samples.push((now_ms, total_tokens));
+    samples.retain(|(timestamp, _)| *timestamp >= window_start);
+
+    if samples.len() < 2 {
+        return 0.0;
+    }
+
+    let Some((earliest_ts, earliest_tokens)) = samples.first().copied() else {
+        return 0.0;
+    };
+    let elapsed_ms = now_ms.saturating_sub(earliest_ts);
+    if elapsed_ms == 0 {
+        return 0.0;
+    }
+    let token_delta = total_tokens.saturating_sub(earliest_tokens);
+    (token_delta as f64) / (elapsed_ms as f64 / 1000.0)
+}
+
+fn terminal_columns() -> usize {
+    let default_columns = 115;
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|columns| *columns >= 80)
+        .unwrap_or(default_columns)
 }
 
 fn init_tracing(logs_root: &Path) -> Result<()> {
