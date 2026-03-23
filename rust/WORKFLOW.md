@@ -1,6 +1,7 @@
 ---
 tracker:
   kind: linear
+  workspace_slug: "weaveteam"
   project_slug: "symphony-0c79b11b75ea"
   active_states:
     - Todo

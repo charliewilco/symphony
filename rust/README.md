@@ -160,6 +160,7 @@ Minimal example:
 ---
 tracker:
   kind: linear
+  workspace_slug: "..."
   project_slug: "..."
 workspace:
   root: ~/code/workspaces
@@ -183,6 +184,8 @@ Notes:
 - If a value is missing, defaults are used.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is
   `$LINEAR_API_KEY`.
+- `tracker.workspace_slug` is the Linear workspace slug used for browser links
+  like `https://linear.app/<workspace>/project/<project>/issues`.
 - `tracker.assignee` can be a Linear assignee id or email; issues assigned to a
   different worker are treated as unroutable.
 - For path values, `~` is expanded to the home directory.
