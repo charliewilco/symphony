@@ -278,12 +278,12 @@ fn render_running_row(entry: &RunningSnapshot) -> String {
     format!(
         concat!(
             "<tr>",
-            "<td><div class=\"issue-stack\"><span class=\"issue-id\">{}</span><a class=\"issue-link\" href=\"/api/v1/{}\">JSON details</a></div></td>",
-            "<td><span class=\"state-badge {}\">{}</span></td>",
-            "<td><div class=\"session-stack\"><span class=\"mono\" title=\"{}\">{}</span><span class=\"muted\">{}</span></div></td>",
-            "<td class=\"numeric\">{}</td>",
-            "<td><div class=\"detail-stack\"><span class=\"event-text\" title=\"{}\">{}</span><span class=\"muted event-meta\">{} · <span class=\"mono numeric\">{}</span></span></div></td>",
-            "<td><div class=\"token-stack numeric\"><span>Total: {}</span><span class=\"muted\">In {} / Out {}</span></div></td>",
+            "<td class=\"running-col running-col-issue\"><div class=\"issue-stack\"><span class=\"issue-id\">{}</span><a class=\"issue-link\" href=\"/api/v1/{}\">JSON details</a></div></td>",
+            "<td class=\"running-col running-col-state\"><span class=\"state-badge {}\">{}</span></td>",
+            "<td class=\"running-col running-col-session\"><div class=\"session-stack\"><span class=\"mono\" title=\"{}\">{}</span><span class=\"muted\">{}</span></div></td>",
+            "<td class=\"running-col running-col-runtime numeric\">{}</td>",
+            "<td class=\"running-col running-col-event\"><div class=\"detail-stack\"><span class=\"event-text\" title=\"{}\">{}</span><span class=\"muted event-meta\">{} · <span class=\"mono numeric\">{}</span></span></div></td>",
+            "<td class=\"running-col running-col-tokens numeric\"><div class=\"token-stack numeric\"><span>Total: {}</span><span class=\"muted\">In {} / Out {}</span></div></td>",
             "</tr>"
         ),
         escape_html(&entry.identifier),

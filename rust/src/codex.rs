@@ -654,16 +654,11 @@ fn protocol_message_candidate(data: &str) -> bool {
 }
 
 fn log_non_json_stream_line(data: &str, stream_label: &str) {
-    let text = data.trim();
+    let text = summarize_stream_line(data);
     if text.is_empty() {
         return;
     }
-    let snippet = if text.len() > 1_000 {
-        &text[..1_000]
-    } else {
-        text
-    };
-    let lower = snippet.to_ascii_lowercase();
+    let lower = text.to_ascii_lowercase();
     if [
         "error",
         "warn",
@@ -676,10 +671,106 @@ fn log_non_json_stream_line(data: &str, stream_label: &str) {
     .iter()
     .any(|term| lower.contains(term))
     {
-        tracing::warn!("Codex {stream_label} output: {snippet}");
+        tracing::warn!("Codex {stream_label} output: {text}");
     } else {
-        tracing::debug!("Codex {stream_label} output: {snippet}");
+        tracing::debug!("Codex {stream_label} output: {text}");
     }
+}
+
+fn summarize_stream_line(data: &str) -> String {
+    let text = strip_ansi_escape_sequences(data.trim());
+    if text.is_empty() {
+        return text;
+    }
+
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(summary) = summarize_tracing_style_line(&collapsed) {
+        return summary;
+    }
+
+    truncate_text(&collapsed, 320)
+}
+
+fn summarize_tracing_style_line(line: &str) -> Option<String> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    let level_index = tokens.iter().position(|token| {
+        matches!(
+            *token,
+            "ERROR"
+                | "WARN"
+                | "INFO"
+                | "DEBUG"
+                | "TRACE"
+                | "error"
+                | "warn"
+                | "info"
+                | "debug"
+                | "trace"
+        )
+    })?;
+    let level = tokens.get(level_index)?;
+    let target = tokens.get(level_index + 1)?.trim_end_matches(':');
+    let message = tokens.get(level_index + 2..)?.join(" ").trim().to_string();
+    if message.is_empty() {
+        return Some(format!("{level} {target}"));
+    }
+    Some(format!(
+        "{level} {target}: {}",
+        truncate_text(&message, 240)
+    ))
+}
+
+fn strip_ansi_escape_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{07}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        if matches!(chars.peek().copied(), Some('\\')) {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = chars.next();
+            }
+            None => break,
+        }
+    }
+    output
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return value.chars().take(width).collect();
+    }
+    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 #[cfg(test)]
@@ -795,6 +886,15 @@ mod tests {
             approval_decision("item/fileChange/requestApproval"),
             "acceptForSession"
         );
+    }
+
+    #[test]
+    fn summarizes_stream_lines_without_ansi_noise() {
+        let line = "\u{1b}[2m2026-03-23T07:48:39.727186Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m \u{1b}[2mcodex_core::compact_remote\u{1b}[0m\u{1b}[2m:\u{1b}[0m remote compaction failed turn_id=019d19aa-d318-7330-90e4-61a80979f064";
+        let summary = summarize_stream_line(line);
+        assert!(!summary.contains("\u{1b}"));
+        assert!(summary.starts_with("ERROR codex_core::compact_remote: remote compaction failed"));
+        assert!(summary.contains("turn_id=019d19aa-d318-7330-90e4-61a80979f064"));
     }
 
     #[test]

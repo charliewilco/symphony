@@ -642,12 +642,53 @@ fn format_count(value: u64) -> String {
 }
 
 fn sanitize_line(value: &str) -> String {
-    value
+    strip_ansi_escape_sequences(value)
         .replace("\\n", " ")
         .replace(['\n', '\r'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn strip_ansi_escape_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{07}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        if matches!(chars.peek().copied(), Some('\\')) {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = chars.next();
+            }
+            None => break,
+        }
+    }
+    output
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1089,6 +1130,15 @@ mod tests {
                 "message": "{\"method\":\"turn/completed\""
             }))),
             "malformed JSON event from codex"
+        );
+    }
+
+    #[test]
+    fn sanitizes_ansi_escape_sequences_in_messages() {
+        let line = "\u{1b}[2m2026-03-23T07:48:39.727186Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m \u{1b}[2mcodex_core::codex\u{1b}[0m\u{1b}[2m:\u{1b}[0m Failed to run pre-sampling compact";
+        assert_eq!(
+            sanitize_line(line),
+            "2026-03-23T07:48:39.727186Z ERROR codex_core::codex: Failed to run pre-sampling compact"
         );
     }
 

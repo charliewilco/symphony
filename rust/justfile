@@ -20,6 +20,8 @@ check: fmt-check clippy test
 build:
     cargo build --release --bin rsymphony
 
+alias b := build
+
 run workflow="./WORKFLOW.md":
     cargo run --bin rsymphony -- --i-understand-that-this-will-be-running-without-the-usual-guardrails {{workflow}}
 

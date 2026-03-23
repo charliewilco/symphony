@@ -47,7 +47,23 @@ rustc --version
 cargo --version
 ```
 
+If you do not already have Rust, install it with `rustup`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup default stable
+```
+
+You also need a Linear API key before Symphony can talk to Linear:
+
+```bash
+export LINEAR_API_KEY=...
+```
+
 ## Run
+
+From a fresh checkout:
 
 ```bash
 git clone https://github.com/openai/symphony
@@ -64,22 +80,56 @@ You can also use the local task runner:
 just run ./WORKFLOW.md
 ```
 
-The terminal dashboard renders automatically in a local TTY by default. Start the
-web dashboard explicitly with `--port` when you want the browser UI.
+The terminal dashboard renders automatically in a local TTY by default. Start
+the web dashboard explicitly with `--port` when you want the browser UI.
 
 ## Install
 
-Install `rsymphony` into Cargo's global bin directory:
+Install `rsymphony` into Cargo's global bin directory with the `just` alias:
 
 ```bash
 cd rust
-just install
+just i
 ```
 
-Equivalent raw Cargo command:
+That alias expands to Cargo's global install flow:
 
 ```bash
 cargo install --path . --bin rsymphony --force
+```
+
+If you prefer not to use `just`, run the raw Cargo command directly:
+
+```bash
+cd rust
+cargo install --path . --bin rsymphony --force
+```
+
+After installation, verify the binary is available:
+
+```bash
+which rsymphony
+rsymphony --help
+```
+
+If your shell does not find `rsymphony`, add Cargo's bin directory to your
+`PATH`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+To remove the installed binary later:
+
+```bash
+cd rust
+just u
+```
+
+Or with Cargo:
+
+```bash
+cargo uninstall rsymphony
 ```
 
 ## Configuration
@@ -145,6 +195,11 @@ Notes:
   workflow and logs the reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- If the terminal dashboard looks wrong, confirm you are running in a real TTY
+  and that `NO_COLOR` is not set.
+- If the process fails to reach Linear, check `LINEAR_API_KEY` first.
+- If `rsymphony` is not found after install, reopen your shell or update
+  `PATH` to include `$HOME/.cargo/bin`.
 
 ## Project layout
 
