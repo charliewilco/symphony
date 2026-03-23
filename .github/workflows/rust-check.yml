@@ -1,0 +1,40 @@
+name: rust-check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rust-check.yml"
+      - "rust/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/rust-check.yml"
+      - "rust/**"
+
+jobs:
+  rust-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Run Rust checks
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test -q
