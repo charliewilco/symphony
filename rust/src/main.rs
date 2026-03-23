@@ -160,12 +160,12 @@ async fn run_terminal_dashboard(
 }
 
 const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_CYAN: &str = "\x1b[38;5;109m";
-const ANSI_GREEN: &str = "\x1b[38;5;108m";
-const ANSI_YELLOW: &str = "\x1b[38;5;180m";
-const ANSI_MAGENTA: &str = "\x1b[38;5;141m";
-const ANSI_RED: &str = "\x1b[38;5;174m";
-const ANSI_BLUE: &str = "\x1b[38;5;110m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BLUE: &str = "\x1b[34m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
 const RUNNING_ID_WIDTH: usize = 8;
