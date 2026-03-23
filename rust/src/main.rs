@@ -136,6 +136,7 @@ async fn run_terminal_dashboard(
             tps,
             Some(terminal_columns()),
         );
+        let content = colorize_terminal_dashboard(content);
 
         let content_changed = last_rendered_content.as_deref() != Some(content.as_str());
         let should_render = should_render_content(
@@ -155,6 +156,101 @@ async fn run_terminal_dashboard(
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(refresh_ms.max(1))).await;
+    }
+}
+
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_BLUE: &str = "\x1b[34m";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+fn colorize_terminal_dashboard(content: String) -> String {
+    if std::env::var("NO_COLOR").is_ok() {
+        return content;
+    }
+
+    let mut output = String::new();
+    for line in content.lines() {
+        output.push_str(&colorize_line(line));
+        output.push('\n');
+    }
+    output
+}
+
+fn colorize_line(line: &str) -> String {
+    if line.starts_with("╭─ SYMPHONY STATUS") {
+        return format!("{ANSI_BOLD}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("│ Orchestrator snapshot unavailable") {
+        return format!("{ANSI_RED}{ANSI_BOLD}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("│ Agents: ") {
+        return format!(
+            "{ANSI_BOLD}│ Agents: {ANSI_GREEN}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("│ Throughput: ") {
+        return format!(
+            "{ANSI_BOLD}│ Throughput: {ANSI_CYAN}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("│ Runtime: ") {
+        return format!(
+            "{ANSI_BOLD}│ Runtime: {ANSI_MAGENTA}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("│ Tokens: ") {
+        return format!(
+            "{ANSI_BOLD}│ Tokens: {ANSI_YELLOW}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("│ Rate Limits: ") {
+        return format!(
+            "{ANSI_BOLD}│ Rate Limits: {ANSI_BLUE}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("│ Project: ") || line.starts_with("│ Dashboard: ") {
+        return format!("{ANSI_BOLD}│ {ANSI_CYAN}{}{ANSI_RESET}", &line[2..]);
+    }
+    if line.starts_with("│ Next refresh: ") {
+        return format!(
+            "{ANSI_BOLD}│ Next refresh: {ANSI_CYAN}{}{ANSI_RESET}",
+            line_tail(line)
+        );
+    }
+    if line.starts_with("├─ Running") || line.starts_with("├─ Backoff queue") {
+        return format!("{ANSI_BOLD}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("│ ● ") {
+        return format!("{ANSI_CYAN}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("│  ↻ ") {
+        return format!("{ANSI_YELLOW}{line}{ANSI_RESET}");
+    }
+    if line.trim() == "│" {
+        return format!("{ANSI_DIM}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("╰") {
+        return format!("{ANSI_DIM}{line}{ANSI_RESET}");
+    }
+    line.to_string()
+}
+
+fn line_tail(line: &str) -> &str {
+    if let Some(position) = line.find(": ") {
+        &line[position + 2..]
+    } else {
+        ""
     }
 }
 
