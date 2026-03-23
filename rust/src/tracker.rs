@@ -30,9 +30,11 @@ pub struct Issue {
     pub url: Option<String>,
     pub labels: Vec<String>,
     pub blocked_by: Vec<BlockerRef>,
+    pub assigned_to_worker: bool,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub assignee_id: Option<String>,
+    pub assignee_email: Option<String>,
 }
 
 impl Issue {
@@ -136,6 +138,10 @@ impl Issue {
                 .map(|value| liquid::model::Value::scalar(value.to_rfc3339()))
                 .unwrap_or(liquid::model::Value::Nil),
         );
+        object.insert(
+            "assigned_to_worker".into(),
+            liquid::model::Value::scalar(self.assigned_to_worker),
+        );
         object
     }
 }
@@ -208,7 +214,7 @@ impl Tracker for LinearTracker {
                 branchName
                 createdAt
                 updatedAt
-                assignee { id }
+                assignee { id email }
                 state { name }
                 labels { nodes { name } }
                 blockedByIssues { nodes { id identifier state { name } } }
@@ -224,12 +230,13 @@ impl Tracker for LinearTracker {
         });
 
         let payload = self.graphql(query, variables, settings).await?;
-        parse_linear_issue_nodes(
+        let issues = parse_linear_issue_nodes(
             payload
                 .pointer("/data/issues/nodes")
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
-        )
+        )?;
+        Ok(apply_routing_to_issues(issues, settings))
     }
 
     async fn fetch_issue_states_by_ids(
@@ -254,7 +261,7 @@ impl Tracker for LinearTracker {
                 branchName
                 createdAt
                 updatedAt
-                assignee { id }
+                assignee { id email }
                 state { name }
                 labels { nodes { name } }
                 blockedByIssues { nodes { id identifier state { name } } }
@@ -264,12 +271,13 @@ impl Tracker for LinearTracker {
         "#;
 
         let payload = self.graphql(query, json!({ "ids": ids }), settings).await?;
-        parse_linear_issue_nodes(
+        let issues = parse_linear_issue_nodes(
             payload
                 .pointer("/data/issues/nodes")
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
-        )
+        )?;
+        Ok(apply_routing_to_issues(issues, settings))
     }
 
     async fn fetch_issues_by_states(
@@ -305,7 +313,7 @@ impl Tracker for LinearTracker {
                 branchName
                 createdAt
                 updatedAt
-                assignee { id }
+                assignee { id email }
                 state { name }
                 labels { nodes { name } }
                 blockedByIssues { nodes { id identifier state { name } } }
@@ -321,12 +329,13 @@ impl Tracker for LinearTracker {
                 settings,
             )
             .await?;
-        parse_linear_issue_nodes(
+        let issues = parse_linear_issue_nodes(
             payload
                 .pointer("/data/issues/nodes")
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
-        )
+        )?;
+        Ok(apply_routing_to_issues(issues, settings))
     }
 
     async fn graphql(
@@ -542,6 +551,15 @@ fn parse_linear_issue_nodes(value: JsonValue) -> Result<Vec<Issue>> {
 }
 
 fn parse_linear_issue(value: JsonValue) -> Result<Issue> {
+    let assignee_id = value
+        .pointer("/assignee/id")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string);
+    let assignee_email = value
+        .pointer("/assignee/email")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string);
+
     let state = value
         .pointer("/state/name")
         .and_then(JsonValue::as_str)
@@ -616,6 +634,7 @@ fn parse_linear_issue(value: JsonValue) -> Result<Issue> {
             .map(ToString::to_string),
         labels,
         blocked_by,
+        assigned_to_worker: true,
         created_at: value
             .get("createdAt")
             .and_then(JsonValue::as_str)
@@ -626,11 +645,28 @@ fn parse_linear_issue(value: JsonValue) -> Result<Issue> {
             .and_then(JsonValue::as_str)
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc)),
-        assignee_id: value
-            .pointer("/assignee/id")
-            .and_then(JsonValue::as_str)
-            .map(ToString::to_string),
+        assignee_id,
+        assignee_email,
     })
+}
+
+fn apply_routing_to_issues(mut issues: Vec<Issue>, settings: &Settings) -> Vec<Issue> {
+    for issue in &mut issues {
+        issue.assigned_to_worker = assigned_to_worker(issue, settings);
+    }
+    issues
+}
+
+fn assigned_to_worker(issue: &Issue, settings: &Settings) -> bool {
+    let Some(assignee_filter) = settings.tracker.assignee.as_deref().map(str::trim) else {
+        return true;
+    };
+    if assignee_filter.is_empty() {
+        return true;
+    }
+
+    issue.assignee_id.as_deref() == Some(assignee_filter)
+        || issue.assignee_email.as_deref() == Some(assignee_filter)
 }
 
 #[cfg(test)]
@@ -663,9 +699,11 @@ mod tests {
             url: None,
             labels: vec![],
             blocked_by: vec![],
+            assigned_to_worker: true,
             created_at: None,
             updated_at: None,
             assignee_id: None,
+            assignee_email: None,
         }
     }
 
@@ -689,5 +727,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated[0].state, "Done");
+    }
+
+    #[test]
+    fn assigned_to_worker_accepts_matching_assignee_id_or_email() {
+        let mut issue = issue();
+        issue.assignee_id = Some("worker-id".to_string());
+        issue.assignee_email = Some("worker@example.com".to_string());
+
+        let id_settings = Settings::from_workflow(
+            &LoadedWorkflow {
+                config: serde_yaml::from_str("tracker:\n  kind: memory\n  assignee: worker-id\n")
+                    .unwrap(),
+                prompt_template: String::new(),
+                prompt: String::new(),
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        assert!(super::assigned_to_worker(&issue, &id_settings));
+
+        let email_settings = Settings::from_workflow(
+            &LoadedWorkflow {
+                config: serde_yaml::from_str(
+                    "tracker:\n  kind: memory\n  assignee: worker@example.com\n",
+                )
+                .unwrap(),
+                prompt_template: String::new(),
+                prompt: String::new(),
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        assert!(super::assigned_to_worker(&issue, &email_settings));
+    }
+
+    #[test]
+    fn assigned_to_worker_rejects_non_matching_assignee_filter() {
+        let mut issue = issue();
+        issue.assignee_id = Some("worker-id".to_string());
+
+        let settings = Settings::from_workflow(
+            &LoadedWorkflow {
+                config: serde_yaml::from_str(
+                    "tracker:\n  kind: memory\n  assignee: somebody-else\n",
+                )
+                .unwrap(),
+                prompt_template: String::new(),
+                prompt: String::new(),
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+        assert!(!super::assigned_to_worker(&issue, &settings));
     }
 }

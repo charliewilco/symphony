@@ -726,9 +726,11 @@ mod tests {
             url: Some("https://example.com/issues/MT-1".to_string()),
             labels: vec![],
             blocked_by: vec![],
+            assigned_to_worker: true,
             created_at: None,
             updated_at: None,
             assignee_id: None,
+            assignee_email: None,
         }
     }
 

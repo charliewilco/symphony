@@ -112,6 +112,13 @@ enum RetryKind {
     Failure,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerSelection {
+    Local,
+    Host(String),
+    NoCapacity,
+}
+
 struct RetryRequest {
     issue_id: String,
     attempt: u32,
@@ -325,6 +332,12 @@ impl OrchestratorRuntime {
             if !self.should_dispatch_issue(&issue, settings).await {
                 continue;
             }
+            let Some(issue) = self
+                .revalidate_issue_for_dispatch(issue, tracker.clone(), settings)
+                .await?
+            else {
+                continue;
+            };
             self.dispatch_issue(issue, None, None, settings, tracker.clone())
                 .await?;
         }
@@ -369,6 +382,33 @@ impl OrchestratorRuntime {
                 state.claimed.remove(&retry.issue_id);
                 continue;
             };
+            let Some(issue) = self
+                .revalidate_issue_for_dispatch(issue, tracker.clone(), settings)
+                .await?
+            else {
+                let mut state = self.state.lock().await;
+                state.retry_attempts.remove(&retry.issue_id);
+                state.claimed.remove(&retry.issue_id);
+                continue;
+            };
+
+            if !self
+                .can_dispatch_retry(&issue, retry.worker_host.as_deref(), settings)
+                .await
+            {
+                self.schedule_issue_retry(RetryRequest {
+                    issue_id: issue.id.clone(),
+                    attempt: retry.attempt.saturating_add(1),
+                    retry_kind: RetryKind::Failure,
+                    identifier: Some(issue.identifier.clone()),
+                    error: Some("no available orchestrator slots".to_string()),
+                    worker_host: retry.worker_host.clone(),
+                    workspace_path: retry.workspace_path.clone(),
+                })
+                .await;
+                continue;
+            }
+
             self.dispatch_issue(
                 issue,
                 Some(retry.attempt),
@@ -412,7 +452,7 @@ impl OrchestratorRuntime {
                 if terminal_state(issue, settings) {
                     self.terminate_running_issue(&issue_id, true, settings)
                         .await;
-                } else if !active_state(issue, settings) {
+                } else if !active_state(issue, settings) || !issue_routable_to_worker(issue) {
                     self.terminate_running_issue(&issue_id, false, settings)
                         .await;
                 }
@@ -468,7 +508,10 @@ impl OrchestratorRuntime {
     }
 
     async fn should_dispatch_issue(&self, issue: &Issue, settings: &Settings) -> bool {
-        if !active_state(issue, settings) || terminal_state(issue, settings) {
+        if !active_state(issue, settings)
+            || terminal_state(issue, settings)
+            || !issue_routable_to_worker(issue)
+        {
             return false;
         }
         {
@@ -489,19 +532,20 @@ impl OrchestratorRuntime {
             if same_state_running >= settings.max_concurrent_agents_for_state(&issue.state) {
                 return false;
             }
+            if matches!(
+                select_worker_host_for_state(
+                    &state,
+                    None,
+                    settings.worker.ssh_hosts.as_slice(),
+                    settings.worker.max_concurrent_agents_per_host,
+                ),
+                WorkerSelection::NoCapacity
+            ) {
+                return false;
+            }
         }
 
-        if normalize_issue_state(&issue.state) == "todo"
-            && issue.blocked_by.iter().any(|blocker| {
-                blocker
-                    .state
-                    .as_deref()
-                    .is_some_and(|state| !terminal_state_name(state, settings))
-            })
-        {
-            return false;
-        }
-        true
+        !todo_issue_blocked_by_non_terminal(issue, settings)
     }
 
     async fn dispatch_issue(
@@ -512,9 +556,14 @@ impl OrchestratorRuntime {
         settings: &Settings,
         tracker: Arc<dyn Tracker>,
     ) -> Result<()> {
-        let worker_host = self
+        let worker_host = match self
             .select_worker_host(preferred_worker_host, settings)
-            .await;
+            .await
+        {
+            WorkerSelection::Local => None,
+            WorkerSelection::Host(host) => Some(host.to_string()),
+            WorkerSelection::NoCapacity => return Ok(()),
+        };
         let issue_id = issue.id.clone();
         let workflow = self.workflow_store.current().await;
         let task = tokio::spawn(agent_runner::run(
@@ -562,11 +611,14 @@ impl OrchestratorRuntime {
         &self,
         preferred_worker_host: Option<String>,
         settings: &Settings,
-    ) -> Option<String> {
-        if let Some(host) = preferred_worker_host {
-            return Some(host);
-        }
-        settings.worker.ssh_hosts.first().cloned()
+    ) -> WorkerSelection {
+        let state = self.state.lock().await;
+        select_worker_host_for_state(
+            &state,
+            preferred_worker_host.as_deref(),
+            settings.worker.ssh_hosts.as_slice(),
+            settings.worker.max_concurrent_agents_per_host,
+        )
     }
 
     async fn terminate_running_issue(
@@ -592,6 +644,56 @@ impl OrchestratorRuntime {
                 .await;
             }
         }
+    }
+
+    async fn revalidate_issue_for_dispatch(
+        &self,
+        issue: Issue,
+        tracker: Arc<dyn Tracker>,
+        settings: &Settings,
+    ) -> Result<Option<Issue>> {
+        let refreshed = tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id), settings)
+            .await?;
+        let Some(issue) = refreshed.into_iter().next() else {
+            return Ok(None);
+        };
+        if retry_candidate_issue(&issue, settings) {
+            Ok(Some(issue))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn can_dispatch_retry(
+        &self,
+        issue: &Issue,
+        preferred_worker_host: Option<&str>,
+        settings: &Settings,
+    ) -> bool {
+        if !retry_candidate_issue(issue, settings) {
+            return false;
+        }
+
+        let state = self.state.lock().await;
+        if state.running.len() >= state.max_concurrent_agents {
+            return false;
+        }
+        if running_issue_count_for_state(&state.running, &issue.state)
+            >= settings.max_concurrent_agents_for_state(&issue.state)
+        {
+            return false;
+        }
+
+        !matches!(
+            select_worker_host_for_state(
+                &state,
+                preferred_worker_host,
+                settings.worker.ssh_hosts.as_slice(),
+                settings.worker.max_concurrent_agents_per_host,
+            ),
+            WorkerSelection::NoCapacity
+        )
     }
 
     async fn schedule_issue_retry(&mut self, request: RetryRequest) {
@@ -1009,6 +1111,27 @@ fn active_state(issue: &Issue, settings: &Settings) -> bool {
         .any(|state| normalize_issue_state(state) == normalize_issue_state(&issue.state))
 }
 
+fn issue_routable_to_worker(issue: &Issue) -> bool {
+    issue.assigned_to_worker
+}
+
+fn retry_candidate_issue(issue: &Issue, settings: &Settings) -> bool {
+    active_state(issue, settings)
+        && !terminal_state(issue, settings)
+        && issue_routable_to_worker(issue)
+        && !todo_issue_blocked_by_non_terminal(issue, settings)
+}
+
+fn todo_issue_blocked_by_non_terminal(issue: &Issue, settings: &Settings) -> bool {
+    normalize_issue_state(&issue.state) == "todo"
+        && issue.blocked_by.iter().any(|blocker| {
+            blocker
+                .state
+                .as_deref()
+                .is_none_or(|state| !terminal_state_name(state, settings))
+        })
+}
+
 fn terminal_state(issue: &Issue, settings: &Settings) -> bool {
     terminal_state_name(&issue.state, settings)
 }
@@ -1028,11 +1151,76 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn running_issue_count_for_state(
+    running: &HashMap<String, RunningEntry>,
+    issue_state: &str,
+) -> usize {
+    let normalized_state = normalize_issue_state(issue_state);
+    running
+        .values()
+        .filter(|entry| normalize_issue_state(&entry.issue.state) == normalized_state)
+        .count()
+}
+
+fn running_worker_host_count(running: &HashMap<String, RunningEntry>, worker_host: &str) -> usize {
+    running
+        .values()
+        .filter(|entry| entry.worker_host.as_deref() == Some(worker_host))
+        .count()
+}
+
+fn worker_host_slots_available(
+    state: &OrchestratorState,
+    worker_host: &str,
+    max_per_host: Option<usize>,
+) -> bool {
+    match max_per_host {
+        Some(limit) if limit > 0 => running_worker_host_count(&state.running, worker_host) < limit,
+        _ => true,
+    }
+}
+
+fn select_worker_host_for_state(
+    state: &OrchestratorState,
+    preferred_worker_host: Option<&str>,
+    ssh_hosts: &[String],
+    max_per_host: Option<usize>,
+) -> WorkerSelection {
+    if ssh_hosts.is_empty() {
+        return WorkerSelection::Local;
+    }
+
+    let available_hosts = ssh_hosts
+        .iter()
+        .map(String::as_str)
+        .filter(|host| worker_host_slots_available(state, host, max_per_host))
+        .collect::<Vec<_>>();
+
+    if available_hosts.is_empty() {
+        return WorkerSelection::NoCapacity;
+    }
+
+    if let Some(preferred) = preferred_worker_host
+        && available_hosts.contains(&preferred)
+    {
+        return WorkerSelection::Host(preferred.to_string());
+    }
+
+    let selected = available_hosts
+        .into_iter()
+        .enumerate()
+        .min_by_key(|(index, host)| (running_worker_host_count(&state.running, host), *index))
+        .map(|(_, host)| host)
+        .expect("available_hosts is not empty");
+    WorkerSelection::Host(selected.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tracker::Issue;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn issue() -> Issue {
         Issue {
@@ -1046,9 +1234,36 @@ mod tests {
             url: None,
             labels: vec![],
             blocked_by: vec![],
+            assigned_to_worker: true,
             created_at: None,
             updated_at: None,
             assignee_id: None,
+            assignee_email: None,
+        }
+    }
+
+    fn running_entry(issue: Issue, worker_host: Option<&str>) -> RunningEntry {
+        RunningEntry {
+            identifier: issue.identifier.clone(),
+            issue,
+            started_at: Utc::now(),
+            session_id: None,
+            codex_app_server_pid: None,
+            codex_input_tokens: 0,
+            codex_output_tokens: 0,
+            codex_total_tokens: 0,
+            codex_last_reported_input_tokens: 0,
+            codex_last_reported_output_tokens: 0,
+            codex_last_reported_total_tokens: 0,
+            turn_count: 0,
+            last_codex_timestamp: None,
+            last_codex_message: None,
+            last_codex_event: None,
+            runtime_seconds: 0,
+            workspace_path: None,
+            worker_host: worker_host.map(ToString::to_string),
+            task: tokio::spawn(async {}),
+            attempt: None,
         }
     }
 
@@ -1228,5 +1443,96 @@ mod tests {
         assert_eq!(entry.codex_input_tokens, 10);
         assert_eq!(entry.codex_output_tokens, 4);
         assert_eq!(entry.codex_total_tokens, 14);
+    }
+
+    #[tokio::test]
+    async fn select_worker_host_prefers_preferred_host_when_capacity_exists() {
+        let mut running = HashMap::new();
+        running.insert(
+            "issue-1".to_string(),
+            running_entry(issue(), Some("host-a")),
+        );
+        let state = OrchestratorState {
+            running,
+            ..OrchestratorState::default()
+        };
+        let ssh_hosts = vec!["host-a".to_string(), "host-b".to_string()];
+        let selection = select_worker_host_for_state(&state, Some("host-a"), &ssh_hosts, Some(2));
+        assert_eq!(selection, WorkerSelection::Host("host-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn select_worker_host_chooses_least_loaded_available_host() {
+        let mut running = HashMap::new();
+        for (issue_id, host) in [
+            ("issue-1", "host-a"),
+            ("issue-2", "host-a"),
+            ("issue-3", "host-b"),
+        ] {
+            let mut issue = issue();
+            issue.identifier = issue_id.to_string();
+            running.insert(issue_id.to_string(), running_entry(issue, Some(host)));
+        }
+        let state = OrchestratorState {
+            running,
+            ..OrchestratorState::default()
+        };
+        let ssh_hosts = vec![
+            "host-a".to_string(),
+            "host-b".to_string(),
+            "host-c".to_string(),
+        ];
+        let selection = select_worker_host_for_state(&state, None, &ssh_hosts, Some(3));
+        assert_eq!(selection, WorkerSelection::Host("host-c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn select_worker_host_reports_no_capacity_when_all_hosts_are_full() {
+        let mut running = HashMap::new();
+        for (issue_id, host) in [("issue-1", "host-a"), ("issue-2", "host-b")] {
+            let mut issue = issue();
+            issue.identifier = issue_id.to_string();
+            running.insert(issue_id.to_string(), running_entry(issue, Some(host)));
+        }
+        let state = OrchestratorState {
+            running,
+            ..OrchestratorState::default()
+        };
+        let ssh_hosts = vec!["host-a".to_string(), "host-b".to_string()];
+        let selection = select_worker_host_for_state(&state, None, &ssh_hosts, Some(1));
+        assert_eq!(selection, WorkerSelection::NoCapacity);
+    }
+
+    #[test]
+    fn retry_candidate_issue_requires_routable_and_unblocked_active_issue() {
+        let settings = Settings::from_workflow(
+            &crate::workflow::LoadedWorkflow {
+                config: serde_yaml::from_str(
+                    "tracker:\n  kind: memory\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n",
+                )
+                .unwrap(),
+                prompt_template: String::new(),
+                prompt: String::new(),
+            },
+            &crate::config::CliOverrides::default(),
+        )
+        .unwrap();
+
+        let mut blocked = issue();
+        blocked.state = "Todo".to_string();
+        blocked.blocked_by = vec![crate::tracker::BlockerRef {
+            id: Some("issue-2".to_string()),
+            identifier: Some("MT-2".to_string()),
+            state: Some("In Progress".to_string()),
+        }];
+        assert!(!retry_candidate_issue(&blocked, &settings));
+
+        let mut unroutable = issue();
+        unroutable.assigned_to_worker = false;
+        assert!(!retry_candidate_issue(&unroutable, &settings));
+
+        let mut valid = issue();
+        valid.state = "In Progress".to_string();
+        assert!(retry_candidate_issue(&valid, &settings));
     }
 }
