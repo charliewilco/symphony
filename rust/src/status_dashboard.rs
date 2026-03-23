@@ -346,7 +346,12 @@ fn format_project_link_html_lines(
         .tracker
         .project_slug
         .as_deref()
-        .map(linear_project_url);
+        .map(|project_slug| {
+            linear_project_url_with_workspace(
+                settings.tracker.workspace_slug.as_deref(),
+                project_slug,
+            )
+        });
     let mut lines = vec![term_line([
         term("term-strong", "│ Project: "),
         project_value
@@ -534,7 +539,12 @@ fn format_project_link_lines(settings: &Settings, dashboard_url: Option<String>)
             .tracker
             .project_slug
             .as_deref()
-            .map(linear_project_url)
+            .map(|project_slug| {
+                linear_project_url_with_workspace(
+                    settings.tracker.workspace_slug.as_deref(),
+                    project_slug,
+                )
+            })
             .unwrap_or("n/a".to_string())
     )];
     if let Some(dashboard_url) = dashboard_url {
@@ -585,8 +595,13 @@ fn dashboard_url(settings: &Settings) -> Option<String> {
     })
 }
 
-fn linear_project_url(project_slug: &str) -> String {
-    format!("https://linear.app/project/{project_slug}/issues")
+fn linear_project_url_with_workspace(workspace_slug: Option<&str>, project_slug: &str) -> String {
+    match workspace_slug {
+        Some(workspace_slug) if !workspace_slug.trim().is_empty() => {
+            format!("https://linear.app/{workspace_slug}/project/{project_slug}/issues")
+        }
+        _ => format!("https://linear.app/project/{project_slug}/issues"),
+    }
 }
 
 fn dashboard_url_host(host: &str) -> String {
@@ -1043,7 +1058,7 @@ mod tests {
         Settings::from_workflow(
             &LoadedWorkflow {
                 config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  project_slug: demo\nserver:\n  port: 4000\n",
+                    "tracker:\n  kind: memory\n  workspace_slug: weaveteam\n  project_slug: demo\nserver:\n  port: 4000\n",
                 )
                 .unwrap(),
                 prompt_template: String::new(),
@@ -1154,7 +1169,7 @@ mod tests {
         assert!(rendered.contains("approval"));
         assert!(rendered.contains("error=error with newline"));
         assert!(rendered.contains("Throughput: 658,875 tps"));
-        assert!(rendered.contains("https://linear.app/project/demo/issues"));
+        assert!(rendered.contains("https://linear.app/weaveteam/project/demo/issues"));
         assert!(rendered.contains("http://127.0.0.1:4000/"));
         assert!(rendered.contains("1m 30s / 3"));
         assert!(rendered.contains("thread-1-turn-1") || rendered.contains("thre...turn-1"));

@@ -33,6 +33,7 @@ pub struct TrackerSettings {
     pub kind: Option<String>,
     pub endpoint: String,
     pub api_key: Option<String>,
+    pub workspace_slug: Option<String>,
     pub project_slug: Option<String>,
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
@@ -123,6 +124,7 @@ struct RawTracker {
     kind: Option<String>,
     endpoint: Option<String>,
     api_key: Option<String>,
+    workspace_slug: Option<String>,
     project_slug: Option<String>,
     assignee: Option<String>,
     active_states: Option<Vec<String>>,
@@ -229,6 +231,7 @@ impl Settings {
                     .endpoint
                     .unwrap_or_else(|| "https://api.linear.app/graphql".to_string()),
                 api_key: tracker_api_key,
+                workspace_slug: raw.tracker.workspace_slug,
                 project_slug: raw.tracker.project_slug,
                 assignee: tracker_assignee,
                 active_states: raw
@@ -590,6 +593,22 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("missing_linear_api_token"));
+    }
+
+    #[test]
+    fn parses_linear_workspace_slug() {
+        let settings = Settings::from_workflow(
+            &config_value(
+                "tracker:\n  kind: linear\n  workspace_slug: weaveteam\n  project_slug: test\n  api_key: token\n",
+            ),
+            &CliOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.tracker.workspace_slug.as_deref(),
+            Some("weaveteam")
+        );
     }
 
     #[test]
