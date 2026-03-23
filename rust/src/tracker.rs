@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -186,6 +186,11 @@ pub struct LinearTracker {
     client: reqwest::Client,
 }
 
+#[derive(Clone, Debug)]
+struct AssigneeFilter {
+    match_values: HashSet<String>,
+}
+
 #[async_trait]
 impl Tracker for LinearTracker {
     async fn fetch_candidate_issues(&self, settings: &Settings) -> Result<Vec<Issue>> {
@@ -194,14 +199,14 @@ impl Tracker for LinearTracker {
             .project_slug
             .clone()
             .ok_or_else(|| anyhow!("missing_linear_project_slug"))?;
+        let assignee_filter = self.routing_assignee_filter(settings).await?;
 
         let query = r#"
-          query CandidateIssues($project: String!, $states: [String!], $assignee: String) {
+          query CandidateIssues($project: String!, $states: [String!]) {
             issues(
               filter: {
-                project: { slug: { eq: $project } }
+                project: { slugId: { eq: $project } }
                 state: { name: { in: $states } }
-                assignee: { email: { eq: $assignee } }
               }
             ) {
               nodes {
@@ -217,7 +222,12 @@ impl Tracker for LinearTracker {
                 assignee { id email }
                 state { name }
                 labels { nodes { name } }
-                blockedByIssues { nodes { id identifier state { name } } }
+                inverseRelations {
+                  nodes {
+                    type
+                    issue { id identifier state { name } }
+                  }
+                }
               }
             }
           }
@@ -226,7 +236,6 @@ impl Tracker for LinearTracker {
         let variables = json!({
             "project": project_slug,
             "states": settings.tracker.active_states,
-            "assignee": settings.tracker.assignee
         });
 
         let payload = self.graphql(query, variables, settings).await?;
@@ -236,7 +245,7 @@ impl Tracker for LinearTracker {
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
         )?;
-        Ok(apply_routing_to_issues(issues, settings))
+        Ok(apply_routing_to_issues(issues, assignee_filter.as_ref()))
     }
 
     async fn fetch_issue_states_by_ids(
@@ -247,9 +256,10 @@ impl Tracker for LinearTracker {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let assignee_filter = self.routing_assignee_filter(settings).await?;
 
         let query = r#"
-          query IssueStates($ids: [String!]) {
+          query IssueStates($ids: [ID!]) {
             issues(filter: { id: { in: $ids } }) {
               nodes {
                 id
@@ -264,7 +274,12 @@ impl Tracker for LinearTracker {
                 assignee { id email }
                 state { name }
                 labels { nodes { name } }
-                blockedByIssues { nodes { id identifier state { name } } }
+                inverseRelations {
+                  nodes {
+                    type
+                    issue { id identifier state { name } }
+                  }
+                }
               }
             }
           }
@@ -277,7 +292,7 @@ impl Tracker for LinearTracker {
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
         )?;
-        Ok(apply_routing_to_issues(issues, settings))
+        Ok(apply_routing_to_issues(issues, assignee_filter.as_ref()))
     }
 
     async fn fetch_issues_by_states(
@@ -299,7 +314,7 @@ impl Tracker for LinearTracker {
           query IssuesByStates($project: String!, $states: [String!]) {
             issues(
               filter: {
-                project: { slug: { eq: $project } }
+                project: { slugId: { eq: $project } }
                 state: { name: { in: $states } }
               }
             ) {
@@ -316,7 +331,12 @@ impl Tracker for LinearTracker {
                 assignee { id email }
                 state { name }
                 labels { nodes { name } }
-                blockedByIssues { nodes { id identifier state { name } } }
+                inverseRelations {
+                  nodes {
+                    type
+                    issue { id identifier state { name } }
+                  }
+                }
               }
             }
           }
@@ -335,7 +355,7 @@ impl Tracker for LinearTracker {
                 .cloned()
                 .unwrap_or(JsonValue::Array(vec![])),
         )?;
-        Ok(apply_routing_to_issues(issues, settings))
+        Ok(issues)
     }
 
     async fn graphql(
@@ -453,6 +473,52 @@ impl Tracker for LinearTracker {
         } else {
             bail!("issue_update_failed")
         }
+    }
+}
+
+impl LinearTracker {
+    async fn routing_assignee_filter(&self, settings: &Settings) -> Result<Option<AssigneeFilter>> {
+        match settings.tracker.assignee.as_deref() {
+            None => Ok(None),
+            Some(assignee) => self.build_assignee_filter(assignee, settings).await,
+        }
+    }
+
+    async fn build_assignee_filter(
+        &self,
+        assignee: &str,
+        settings: &Settings,
+    ) -> Result<Option<AssigneeFilter>> {
+        let Some(normalized) = normalize_assignee_match_value(assignee) else {
+            return Ok(None);
+        };
+        if normalized.eq_ignore_ascii_case("me") {
+            let payload = self
+                .graphql(
+                    r#"
+                      query ViewerIdentity {
+                        viewer {
+                          id
+                        }
+                      }
+                    "#,
+                    json!({}),
+                    settings,
+                )
+                .await?;
+            let viewer_id = payload
+                .pointer("/data/viewer/id")
+                .and_then(JsonValue::as_str)
+                .and_then(normalize_assignee_match_value)
+                .ok_or_else(|| anyhow!("missing_linear_viewer_identity"))?;
+            return Ok(Some(AssigneeFilter {
+                match_values: HashSet::from([viewer_id]),
+            }));
+        }
+
+        Ok(Some(AssigneeFilter {
+            match_values: HashSet::from([normalized]),
+        }))
     }
 }
 
@@ -581,22 +647,28 @@ fn parse_linear_issue(value: JsonValue) -> Result<Issue> {
         .collect();
 
     let blocked_by = value
-        .pointer("/blockedByIssues/nodes")
+        .pointer("/inverseRelations/nodes")
         .and_then(JsonValue::as_array)
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|blocker| BlockerRef {
-            id: blocker
-                .get("id")
+        .filter(|relation| {
+            relation
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|relation_type| relation_type.trim().eq_ignore_ascii_case("blocks"))
+        })
+        .map(|relation| BlockerRef {
+            id: relation
+                .pointer("/issue/id")
                 .and_then(JsonValue::as_str)
                 .map(ToString::to_string),
-            identifier: blocker
-                .get("identifier")
+            identifier: relation
+                .pointer("/issue/identifier")
                 .and_then(JsonValue::as_str)
                 .map(ToString::to_string),
-            state: blocker
-                .pointer("/state/name")
+            state: relation
+                .pointer("/issue/state/name")
                 .and_then(JsonValue::as_str)
                 .map(ToString::to_string),
         })
@@ -650,23 +722,39 @@ fn parse_linear_issue(value: JsonValue) -> Result<Issue> {
     })
 }
 
-fn apply_routing_to_issues(mut issues: Vec<Issue>, settings: &Settings) -> Vec<Issue> {
+fn apply_routing_to_issues(
+    mut issues: Vec<Issue>,
+    assignee_filter: Option<&AssigneeFilter>,
+) -> Vec<Issue> {
     for issue in &mut issues {
-        issue.assigned_to_worker = assigned_to_worker(issue, settings);
+        issue.assigned_to_worker = assigned_to_worker(issue, assignee_filter);
     }
     issues
 }
 
-fn assigned_to_worker(issue: &Issue, settings: &Settings) -> bool {
-    let Some(assignee_filter) = settings.tracker.assignee.as_deref().map(str::trim) else {
+fn assigned_to_worker(issue: &Issue, assignee_filter: Option<&AssigneeFilter>) -> bool {
+    let Some(assignee_filter) = assignee_filter else {
         return true;
     };
-    if assignee_filter.is_empty() {
-        return true;
-    }
+    issue
+        .assignee_id
+        .as_deref()
+        .and_then(normalize_assignee_match_value)
+        .is_some_and(|assignee_id| assignee_filter.match_values.contains(&assignee_id))
+        || issue
+            .assignee_email
+            .as_deref()
+            .and_then(normalize_assignee_match_value)
+            .is_some_and(|assignee_email| assignee_filter.match_values.contains(&assignee_email))
+}
 
-    issue.assignee_id.as_deref() == Some(assignee_filter)
-        || issue.assignee_email.as_deref() == Some(assignee_filter)
+fn normalize_assignee_match_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -735,31 +823,15 @@ mod tests {
         issue.assignee_id = Some("worker-id".to_string());
         issue.assignee_email = Some("worker@example.com".to_string());
 
-        let id_settings = Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str("tracker:\n  kind: memory\n  assignee: worker-id\n")
-                    .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap();
-        assert!(super::assigned_to_worker(&issue, &id_settings));
+        let id_filter = AssigneeFilter {
+            match_values: HashSet::from([String::from("worker-id")]),
+        };
+        assert!(super::assigned_to_worker(&issue, Some(&id_filter)));
 
-        let email_settings = Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  assignee: worker@example.com\n",
-                )
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap();
-        assert!(super::assigned_to_worker(&issue, &email_settings));
+        let email_filter = AssigneeFilter {
+            match_values: HashSet::from([String::from("worker@example.com")]),
+        };
+        assert!(super::assigned_to_worker(&issue, Some(&email_filter)));
     }
 
     #[test]
@@ -767,18 +839,48 @@ mod tests {
         let mut issue = issue();
         issue.assignee_id = Some("worker-id".to_string());
 
-        let settings = Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  assignee: somebody-else\n",
-                )
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
+        let filter = AssigneeFilter {
+            match_values: HashSet::from([String::from("somebody-else")]),
+        };
+        assert!(!super::assigned_to_worker(&issue, Some(&filter)));
+    }
+
+    #[test]
+    fn parse_linear_issue_extracts_blockers_from_inverse_relations() {
+        let issue = parse_linear_issue(json!({
+            "id": "issue-1",
+            "identifier": "MT-1",
+            "title": "Test",
+            "description": "Body",
+            "priority": 2,
+            "state": { "name": "Todo" },
+            "labels": { "nodes": [] },
+            "inverseRelations": {
+                "nodes": [
+                    {
+                        "type": "blocks",
+                        "issue": {
+                            "id": "issue-2",
+                            "identifier": "MT-2",
+                            "state": { "name": "In Progress" }
+                        }
+                    },
+                    {
+                        "type": "relates",
+                        "issue": {
+                            "id": "issue-3",
+                            "identifier": "MT-3",
+                            "state": { "name": "Todo" }
+                        }
+                    }
+                ]
+            }
+        }))
         .unwrap();
-        assert!(!super::assigned_to_worker(&issue, &settings));
+
+        assert_eq!(issue.blocked_by.len(), 1);
+        assert_eq!(issue.blocked_by[0].id.as_deref(), Some("issue-2"));
+        assert_eq!(issue.blocked_by[0].identifier.as_deref(), Some("MT-2"));
+        assert_eq!(issue.blocked_by[0].state.as_deref(), Some("In Progress"));
     }
 }

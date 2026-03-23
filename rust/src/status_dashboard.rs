@@ -3,6 +3,16 @@ use serde_json::Value as JsonValue;
 use crate::config::Settings;
 use crate::orchestrator::Snapshot;
 
+const RUNNING_ID_WIDTH: usize = 8;
+const RUNNING_STAGE_WIDTH: usize = 14;
+const RUNNING_PID_WIDTH: usize = 8;
+const RUNNING_AGE_WIDTH: usize = 12;
+const RUNNING_TOKENS_WIDTH: usize = 10;
+const RUNNING_SESSION_WIDTH: usize = 14;
+const RUNNING_EVENT_DEFAULT_WIDTH: usize = 44;
+const RUNNING_EVENT_MIN_WIDTH: usize = 12;
+const RUNNING_ROW_CHROME_WIDTH: usize = 10;
+
 pub fn humanize_codex_message(message: Option<&JsonValue>) -> String {
     match message {
         None => "no codex message yet".to_string(),
@@ -33,6 +43,7 @@ pub fn format_snapshot_content(
     terminal_columns: Option<usize>,
 ) -> String {
     let width = terminal_columns.unwrap_or(115).max(80);
+    let running_event_width = running_event_width(Some(width));
     let mut lines = vec!["╭─ SYMPHONY STATUS".to_string()];
 
     match snapshot {
@@ -61,24 +72,19 @@ pub fn format_snapshot_content(
             lines.push(format_project_refresh_line(Some(&snapshot.polling)));
             lines.push("├─ Running".to_string());
             lines.push("│".to_string());
+            lines.push(running_table_header_row(running_event_width));
+            lines.push(running_table_separator_row(running_event_width));
 
             if snapshot.running.is_empty() {
-                lines.push("│ (none)".to_string());
+                lines.push("│  No active agents".to_string());
             } else {
-                for entry in &snapshot.running {
-                    let age = format_runtime_seconds(entry.runtime_seconds);
-                    let event = humanize_codex_message(entry.last_codex_message.as_ref());
-                    let row = format!(
-                        "│ {:<8} {:<14} turns={:<3} age={:<10} tokens={:<8} {}",
-                        entry.identifier,
-                        entry.state,
-                        entry.turn_count,
-                        age,
-                        format_count(entry.codex_total_tokens),
-                        event
-                    );
-                    lines.push(truncate(&sanitize_line(&row), width));
-                }
+                let mut running = snapshot.running.clone();
+                running.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+                lines.extend(
+                    running
+                        .iter()
+                        .map(|entry| format_running_summary(entry, running_event_width)),
+                );
             }
 
             lines.push("│".to_string());
@@ -86,24 +92,11 @@ pub fn format_snapshot_content(
             lines.push("│".to_string());
 
             if snapshot.retrying.is_empty() {
-                lines.push("│ (none)".to_string());
+                lines.push("│  No queued retries".to_string());
             } else {
-                for entry in &snapshot.retrying {
-                    let identifier = entry.identifier.as_deref().unwrap_or(&entry.issue_id);
-                    let error = entry
-                        .error
-                        .as_deref()
-                        .map(sanitize_line)
-                        .unwrap_or_else(|| "retry scheduled".to_string());
-                    let row = format!(
-                        "│ {:<8} attempt={} due_in={} error={}",
-                        identifier,
-                        entry.attempt,
-                        format_due_in(entry.due_in_ms),
-                        error
-                    );
-                    lines.push(truncate(&row, width));
-                }
+                let mut retrying = snapshot.retrying.clone();
+                retrying.sort_by_key(|entry| entry.due_in_ms);
+                lines.extend(retrying.iter().map(format_retry_summary));
             }
         }
         None => {
@@ -114,10 +107,7 @@ pub fn format_snapshot_content(
         }
     }
 
-    lines.push(
-        "╰──────────────────────────────────────────────────────────────────────────────"
-            .to_string(),
-    );
+    lines.push(closing_border(width));
     lines.join("\n")
 }
 
@@ -336,10 +326,12 @@ fn format_project_link_lines(settings: &Settings, dashboard_url: Option<String>)
 }
 
 fn dashboard_url(settings: &Settings) -> Option<String> {
-    settings
-        .server
-        .port
-        .map(|port| format!("http://{}:{port}/", settings.server.host))
+    settings.server.port.map(|port| {
+        format!(
+            "http://{}:{port}/",
+            dashboard_url_host(&settings.server.host)
+        )
+    })
 }
 
 fn linear_project_url(project_slug: &str) -> String {
@@ -350,18 +342,23 @@ fn format_project_refresh_line(polling: Option<&crate::orchestrator::PollingSnap
     match polling {
         Some(polling) if polling.checking => "│ Next refresh: checking now...".to_string(),
         Some(polling) => match polling.next_poll_in_ms {
-            Some(next_poll_in_ms) => format!("│ Next refresh: {}s", next_poll_in_ms / 1000),
+            Some(next_poll_in_ms) => {
+                let seconds = next_poll_in_ms.saturating_add(999) / 1000;
+                format!("│ Next refresh: {seconds}s")
+            }
             None => "│ Next refresh: n/a".to_string(),
         },
         None => "│ Next refresh: n/a".to_string(),
     }
 }
 
-fn format_due_in(due_in_ms: u64) -> String {
-    if due_in_ms < 1000 {
-        format!("{due_in_ms}ms")
-    } else {
-        format!("{}s", due_in_ms / 1000)
+fn dashboard_url_host(host: &str) -> String {
+    let trimmed = host.trim();
+    match trimmed {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        _ if trimmed.starts_with('[') && trimmed.ends_with(']') => trimmed.to_string(),
+        _ if trimmed.contains(':') => format!("[{trimmed}]"),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -372,40 +369,35 @@ fn format_rate_limits(rate_limits: Option<&JsonValue>) -> String {
     let limit_id = map_value(rate_limits, &["limit_id", "limit_name"]).unwrap_or("n/a");
     let primary = rate_limits
         .get("primary")
-        .map(|bucket| sanitize_line(&bucket.to_string()))
+        .map(format_rate_limit_bucket)
         .unwrap_or_else(|| "n/a".to_string());
     let secondary = rate_limits
         .get("secondary")
-        .map(|bucket| sanitize_line(&bucket.to_string()))
+        .map(format_rate_limit_bucket)
         .unwrap_or_else(|| "n/a".to_string());
     let credits = rate_limits
         .get("credits")
-        .map(|bucket| sanitize_line(&bucket.to_string()))
+        .map(format_rate_limit_bucket)
         .unwrap_or_else(|| "n/a".to_string());
     format!("{limit_id} | primary {primary} | secondary {secondary} | credits {credits}")
 }
 
 fn format_runtime_seconds(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
+    let minutes = seconds / 60;
     let seconds = seconds % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
+    format!("{minutes}m {seconds}s")
 }
 
 fn format_count(value: u64) -> String {
-    if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
     }
+    grouped.chars().rev().collect()
 }
 
 fn sanitize_line(value: &str) -> String {
@@ -428,6 +420,193 @@ fn truncate(value: &str, width: usize) -> String {
         truncated.push_str("...");
         truncated
     }
+}
+
+fn format_rate_limit_bucket(bucket: &JsonValue) -> String {
+    if bucket.is_null() {
+        return "n/a".to_string();
+    }
+    if let Some(remaining) = bucket.get("remaining").and_then(as_u64_like)
+        && let Some(limit) = bucket.get("limit").and_then(as_u64_like)
+    {
+        return format!("{remaining}/{limit}");
+    }
+    if let Some(has_credits) = bucket.get("has_credits").and_then(JsonValue::as_bool) {
+        return if has_credits {
+            "yes".to_string()
+        } else {
+            "no".to_string()
+        };
+    }
+    sanitize_line(&bucket.to_string())
+}
+
+fn as_u64_like(value: &JsonValue) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+        })
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn running_table_header_row(running_event_width: usize) -> String {
+    let header = [
+        format_cell("ID", RUNNING_ID_WIDTH, Alignment::Left),
+        format_cell("STAGE", RUNNING_STAGE_WIDTH, Alignment::Left),
+        format_cell("PID", RUNNING_PID_WIDTH, Alignment::Left),
+        format_cell("AGE / TURN", RUNNING_AGE_WIDTH, Alignment::Left),
+        format_cell("TOKENS", RUNNING_TOKENS_WIDTH, Alignment::Left),
+        format_cell("SESSION", RUNNING_SESSION_WIDTH, Alignment::Left),
+        format_cell("EVENT", running_event_width, Alignment::Left),
+    ]
+    .join(" ");
+    format!("│   {header}")
+}
+
+fn running_table_separator_row(running_event_width: usize) -> String {
+    let separator_width = RUNNING_ID_WIDTH
+        + RUNNING_STAGE_WIDTH
+        + RUNNING_PID_WIDTH
+        + RUNNING_AGE_WIDTH
+        + RUNNING_TOKENS_WIDTH
+        + RUNNING_SESSION_WIDTH
+        + running_event_width
+        + 6;
+    format!("│   {}", "─".repeat(separator_width))
+}
+
+fn format_running_summary(
+    entry: &crate::orchestrator::RunningSnapshot,
+    running_event_width: usize,
+) -> String {
+    let issue = format_cell(&entry.identifier, RUNNING_ID_WIDTH, Alignment::Left);
+    let state = format_cell(&entry.state, RUNNING_STAGE_WIDTH, Alignment::Left);
+    let pid = format_cell(
+        entry.codex_app_server_pid.as_deref().unwrap_or("n/a"),
+        RUNNING_PID_WIDTH,
+        Alignment::Left,
+    );
+    let age = format_cell(
+        &format_runtime_and_turns(entry.runtime_seconds, entry.turn_count),
+        RUNNING_AGE_WIDTH,
+        Alignment::Left,
+    );
+    let tokens = format_cell(
+        &format_count(entry.codex_total_tokens),
+        RUNNING_TOKENS_WIDTH,
+        Alignment::Right,
+    );
+    let session = format_cell(
+        &compact_session_id(entry.session_id.as_deref()),
+        RUNNING_SESSION_WIDTH,
+        Alignment::Left,
+    );
+    let event = format_cell(
+        &summarize_message(entry.last_codex_message.as_ref()),
+        running_event_width,
+        Alignment::Left,
+    );
+    format!("│ ● {issue} {state} {pid} {age} {tokens} {session} {event}")
+}
+
+fn format_retry_summary(entry: &crate::orchestrator::RetrySnapshot) -> String {
+    let identifier = entry.identifier.as_deref().unwrap_or(&entry.issue_id);
+    let mut row = format!(
+        "│  ↻ {} attempt={} in {}",
+        identifier,
+        entry.attempt,
+        next_in_words(entry.due_in_ms)
+    );
+    if let Some(error) = entry.error.as_deref().map(sanitize_line)
+        && !error.is_empty()
+    {
+        row.push(' ');
+        row.push_str("error=");
+        row.push_str(&truncate(&error, 96));
+    }
+    row
+}
+
+fn next_in_words(due_in_ms: u64) -> String {
+    let secs = due_in_ms / 1000;
+    let millis = due_in_ms % 1000;
+    format!("{secs}.{:03}s", millis)
+}
+
+fn format_runtime_and_turns(seconds: u64, turn_count: u64) -> String {
+    format!("{} / {}", format_runtime_seconds(seconds), turn_count)
+}
+
+fn compact_session_id(session_id: Option<&str>) -> String {
+    match session_id {
+        None => "n/a".to_string(),
+        Some(session_id) if session_id.chars().count() > 10 => {
+            let start = session_id.chars().take(4).collect::<String>();
+            let end = session_id
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            format!("{start}...{end}")
+        }
+        Some(session_id) => session_id.to_string(),
+    }
+}
+
+fn summarize_message(message: Option<&JsonValue>) -> String {
+    humanize_codex_message(message)
+}
+
+fn running_event_width(terminal_columns: Option<usize>) -> usize {
+    let terminal_columns = terminal_columns.unwrap_or(115);
+    let fixed_width = RUNNING_ID_WIDTH
+        + RUNNING_STAGE_WIDTH
+        + RUNNING_PID_WIDTH
+        + RUNNING_AGE_WIDTH
+        + RUNNING_TOKENS_WIDTH
+        + RUNNING_SESSION_WIDTH;
+    terminal_columns
+        .saturating_sub(fixed_width + RUNNING_ROW_CHROME_WIDTH)
+        .max(RUNNING_EVENT_MIN_WIDTH)
+        .max(RUNNING_EVENT_DEFAULT_WIDTH.min(terminal_columns))
+}
+
+fn closing_border(width: usize) -> String {
+    let dash_count = width.saturating_sub(1).max(79);
+    format!("╰{}", "─".repeat(dash_count))
+}
+
+#[derive(Clone, Copy)]
+enum Alignment {
+    Left,
+    Right,
+}
+
+fn format_cell(value: &str, width: usize, alignment: Alignment) -> String {
+    let value = truncate_plain(&sanitize_line(value), width);
+    match alignment {
+        Alignment::Left => format!("{value:<width$}"),
+        Alignment::Right => format!("{value:>width$}"),
+    }
+}
+
+fn truncate_plain(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return value.chars().take(width).collect();
+    }
+    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 #[cfg(test)]
@@ -539,11 +718,16 @@ mod tests {
         let rendered =
             format_snapshot_content_for_test(Some(&snapshot()), &settings(), 42.0, Some(115));
         assert!(rendered.contains("SYMPHONY STATUS"));
+        assert!(rendered.contains("ID       STAGE"));
+        assert!(rendered.contains("AGE / TURN"));
+        assert!(rendered.contains("SESSION"));
         assert!(rendered.contains("MT-101"));
         assert!(rendered.contains("MT-202"));
         assert!(rendered.contains("approval"));
         assert!(rendered.contains("error=error with newline"));
         assert!(rendered.contains("https://linear.app/project/demo/issues"));
         assert!(rendered.contains("http://127.0.0.1:4000/"));
+        assert!(rendered.contains("1m 30s / 3"));
+        assert!(rendered.contains("thread-1-turn-1") || rendered.contains("thre...turn-1"));
     }
 }
