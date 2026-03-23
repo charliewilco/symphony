@@ -15,7 +15,10 @@ use tracing_subscriber::prelude::*;
 #[command(name = "rsymphony")]
 #[command(about = "Symphony in Rust")]
 struct Args {
-    #[arg(long = "i-understand-that-this-will-be-running-without-the-usual-guardrails")]
+    #[arg(
+        long = "i-understand-that-this-will-be-running-without-the-usual-guardrails",
+        visible_alias = "yolo"
+    )]
     acknowledge_guardrails: bool,
     #[arg(long)]
     logs_root: Option<PathBuf>,
@@ -110,4 +113,25 @@ fn acknowledgement_banner() -> String {
         "To proceed, start with `--i-understand-that-this-will-be-running-without-the-usual-guardrails` CLI argument",
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_guardrail_acknowledgement_flag() {
+        let args = Args::try_parse_from([
+            "rsymphony",
+            "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
+        ])
+        .unwrap();
+        assert!(args.acknowledge_guardrails);
+    }
+
+    #[test]
+    fn accepts_yolo_alias_for_guardrail_acknowledgement() {
+        let args = Args::try_parse_from(["rsymphony", "--yolo"]).unwrap();
+        assert!(args.acknowledge_guardrails);
+    }
 }
