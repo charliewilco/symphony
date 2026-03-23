@@ -27,3 +27,8 @@ install:
     cargo install --path . --bin rsymphony --force
 
 alias i := install
+
+uninstall:
+    cargo uninstall rsymphony
+
+alias u := uninstall

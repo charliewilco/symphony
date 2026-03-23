@@ -48,28 +48,37 @@ pub fn format_snapshot_content(
 
     match snapshot {
         Some(snapshot) => {
-            lines.push(format!(
-                "│ Agents: {}/{}",
-                snapshot.running.len(),
-                settings.agent.max_concurrent_agents
+            lines.push("├─ Status".to_string());
+            lines.push("│".to_string());
+            lines.push(format_three_columns(
+                &format!(
+                    "Agents: {}/{}",
+                    snapshot.running.len(),
+                    settings.agent.max_concurrent_agents
+                ),
+                &format!("Throughput: {} tps", format_tps(tps)),
+                &format!(
+                    "Runtime: {}",
+                    format_runtime_seconds(snapshot.codex_totals.seconds_running)
+                ),
+                width,
             ));
-            lines.push(format!("│ Throughput: {:.1} tps", tps));
-            lines.push(format!(
-                "│ Runtime: {}",
-                format_runtime_seconds(snapshot.codex_totals.seconds_running)
-            ));
-            lines.push(format!(
-                "│ Tokens: in {} | out {} | total {}",
-                format_count(snapshot.codex_totals.input_tokens),
-                format_count(snapshot.codex_totals.output_tokens),
-                format_count(snapshot.codex_totals.total_tokens)
-            ));
-            lines.push(format!(
-                "│ Rate Limits: {}",
-                format_rate_limits(snapshot.rate_limits.as_ref())
+            lines.push(format_three_columns(
+                &format!(
+                    "Tokens: in {} | out {} | total {}",
+                    format_count(snapshot.codex_totals.input_tokens),
+                    format_count(snapshot.codex_totals.output_tokens),
+                    format_count(snapshot.codex_totals.total_tokens)
+                ),
+                &format!(
+                    "Rate Limits: {}",
+                    format_rate_limits(snapshot.rate_limits.as_ref())
+                ),
+                &format_project_refresh(Some(&snapshot.polling)),
+                width,
             ));
             lines.extend(format_project_link_lines(settings, dashboard_url));
-            lines.push(format_project_refresh_line(Some(&snapshot.polling)));
+            lines.push("│".to_string());
             lines.push("├─ Running".to_string());
             lines.push("│".to_string());
             lines.push(running_table_header_row(running_event_width));
@@ -101,13 +110,142 @@ pub fn format_snapshot_content(
         }
         None => {
             lines.push("│ Orchestrator snapshot unavailable".to_string());
-            lines.push(format!("│ Throughput: {:.1} tps", tps));
+            lines.push(format_three_columns(
+                "│ Status unknown",
+                &format!("Throughput: {} tps", format_tps(tps)),
+                &format_project_refresh(None),
+                width,
+            ));
+            lines.push("│".to_string());
             lines.extend(format_project_link_lines(settings, dashboard_url));
-            lines.push("│ Next refresh: n/a".to_string());
         }
     }
 
     lines.push(closing_border(width));
+    lines.join("\n")
+}
+
+pub fn render_snapshot_html_for_test(
+    snapshot: Option<&Snapshot>,
+    settings: &Settings,
+    tps: f64,
+    terminal_columns: Option<usize>,
+) -> String {
+    render_snapshot_html(
+        snapshot,
+        settings,
+        dashboard_url(settings),
+        tps,
+        terminal_columns,
+    )
+}
+
+pub fn render_snapshot_html(
+    snapshot: Option<&Snapshot>,
+    settings: &Settings,
+    dashboard_url: Option<String>,
+    tps: f64,
+    terminal_columns: Option<usize>,
+) -> String {
+    let width = terminal_columns.unwrap_or(115).max(80);
+    let running_event_width = running_event_width(Some(width));
+    let mut lines = vec![term("term-strong", "╭─ SYMPHONY STATUS")];
+
+    match snapshot {
+        Some(snapshot) => {
+            lines.push(term_line([
+                term("term-strong", "│ Agents: "),
+                term("term-green", &snapshot.running.len().to_string()),
+                term("term-muted", "/"),
+                term(
+                    "term-muted",
+                    &settings.agent.max_concurrent_agents.to_string(),
+                ),
+            ]));
+            lines.push(term_line([
+                term("term-strong", "│ Throughput: "),
+                term("term-cyan", &format!("{} tps", format_tps(tps))),
+            ]));
+            lines.push(term_line([
+                term("term-strong", "│ Runtime: "),
+                term(
+                    "term-magenta",
+                    &format_runtime_seconds(snapshot.codex_totals.seconds_running),
+                ),
+            ]));
+            lines.push(term_line([
+                term("term-strong", "│ Tokens: "),
+                term(
+                    "term-yellow",
+                    &format!("in {}", format_count(snapshot.codex_totals.input_tokens)),
+                ),
+                term("term-muted", " | "),
+                term(
+                    "term-yellow",
+                    &format!("out {}", format_count(snapshot.codex_totals.output_tokens)),
+                ),
+                term("term-muted", " | "),
+                term(
+                    "term-yellow",
+                    &format!("total {}", format_count(snapshot.codex_totals.total_tokens)),
+                ),
+            ]));
+            lines.push(term_line([
+                term("term-strong", "│ Rate Limits: "),
+                format_rate_limits_html(snapshot.rate_limits.as_ref()),
+            ]));
+            lines.extend(format_project_link_html_lines(settings, dashboard_url));
+            lines.push(format_project_refresh_html_line(Some(&snapshot.polling)));
+            lines.push(term("term-strong", "├─ Running"));
+            lines.push("│".to_string());
+            lines.push(term(
+                "term-muted",
+                &running_table_header_row(running_event_width),
+            ));
+            lines.push(term(
+                "term-muted",
+                &running_table_separator_row(running_event_width),
+            ));
+
+            if snapshot.running.is_empty() {
+                lines.push(term("term-muted", "│  No active agents"));
+            } else {
+                let mut running = snapshot.running.clone();
+                running.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+                lines.extend(
+                    running
+                        .iter()
+                        .map(|entry| render_running_summary_html(entry, running_event_width)),
+                );
+            }
+
+            lines.push("│".to_string());
+            lines.push(term("term-strong", "├─ Backoff queue"));
+            lines.push("│".to_string());
+
+            if snapshot.retrying.is_empty() {
+                lines.push(term("term-muted", "│  No queued retries"));
+            } else {
+                let mut retrying = snapshot.retrying.clone();
+                retrying.sort_by_key(|entry| entry.due_in_ms);
+                lines.extend(retrying.iter().map(render_retry_summary_html));
+            }
+        }
+        None => {
+            lines.push(term("term-red", "│ Orchestrator snapshot unavailable"));
+            lines.push(term_line([
+                term("term-strong", "│ Throughput: "),
+                term("term-cyan", &format!("{} tps", format_tps(tps))),
+            ]));
+            lines.extend(format_project_link_html_lines(settings, dashboard_url));
+            lines.push(term_line([
+                term("term-strong", "│ Next refresh: "),
+                term("term-muted", "n/a"),
+            ]));
+        }
+    }
+
+    lines.push(term("term-strong", &closing_border(width)));
     lines.join("\n")
 }
 
@@ -198,6 +336,86 @@ fn humanize_codex_event(
         "malformed" => Some("malformed JSON event from codex".to_string()),
         _ => None,
     }
+}
+
+fn format_project_link_html_lines(
+    settings: &Settings,
+    dashboard_url: Option<String>,
+) -> Vec<String> {
+    let project_value = settings
+        .tracker
+        .project_slug
+        .as_deref()
+        .map(linear_project_url);
+    let mut lines = vec![term_line([
+        term("term-strong", "│ Project: "),
+        project_value
+            .map(|value| term("term-cyan", &value))
+            .unwrap_or_else(|| term("term-muted", "n/a")),
+    ])];
+    if let Some(dashboard_url) = dashboard_url {
+        lines.push(term_line([
+            term("term-strong", "│ Dashboard: "),
+            term("term-cyan", &dashboard_url),
+        ]));
+    }
+    lines
+}
+
+fn format_project_refresh_html_line(
+    polling: Option<&crate::orchestrator::PollingSnapshot>,
+) -> String {
+    match polling {
+        Some(polling) if polling.checking => term_line([
+            term("term-strong", "│ Next refresh: "),
+            term("term-cyan", "checking now..."),
+        ]),
+        Some(polling) => match polling.next_poll_in_ms {
+            Some(next_poll_in_ms) => {
+                let seconds = next_poll_in_ms.saturating_add(999) / 1000;
+                term_line([
+                    term("term-strong", "│ Next refresh: "),
+                    term("term-cyan", &format!("{seconds}s")),
+                ])
+            }
+            None => term_line([
+                term("term-strong", "│ Next refresh: "),
+                term("term-muted", "n/a"),
+            ]),
+        },
+        None => term_line([
+            term("term-strong", "│ Next refresh: "),
+            term("term-muted", "n/a"),
+        ]),
+    }
+}
+
+fn format_rate_limits_html(rate_limits: Option<&JsonValue>) -> String {
+    let Some(rate_limits) = rate_limits else {
+        return term("term-muted", "unavailable");
+    };
+    let limit_id = map_value(rate_limits, &["limit_id", "limit_name"]).unwrap_or("n/a");
+    let primary = rate_limits
+        .get("primary")
+        .map(format_rate_limit_bucket)
+        .unwrap_or_else(|| "n/a".to_string());
+    let secondary = rate_limits
+        .get("secondary")
+        .map(format_rate_limit_bucket)
+        .unwrap_or_else(|| "n/a".to_string());
+    let credits = rate_limits
+        .get("credits")
+        .map(format_rate_limit_credits)
+        .unwrap_or_else(|| "n/a".to_string());
+    term_line([
+        term("term-yellow", limit_id),
+        term("term-muted", " | "),
+        term("term-cyan", &format!("primary {primary}")),
+        term("term-muted", " | "),
+        term("term-cyan", &format!("secondary {secondary}")),
+        term("term-muted", " | "),
+        term("term-green", &format!("credits {credits}")),
+    ])
 }
 
 fn humanize_dynamic_tool_event(prefix: &str, payload: Option<&JsonValue>) -> String {
@@ -325,6 +543,39 @@ fn format_project_link_lines(settings: &Settings, dashboard_url: Option<String>)
     lines
 }
 
+fn format_three_columns(left: &str, middle: &str, right: &str, width: usize) -> String {
+    let inner_width = width.saturating_sub(2).max(40);
+    let left_width = (inner_width / 3).max(14);
+    let middle_width = (inner_width / 3).max(14);
+    let right_width = inner_width
+        .saturating_sub(left_width)
+        .saturating_sub(middle_width)
+        .max(12);
+
+    let left = truncate_plain(left, left_width);
+    let middle = truncate_plain(middle, middle_width);
+    let right = truncate_plain(right, right_width.max(12));
+
+    format!(
+        "│ {:<left_width$} {:<middle_width$} {:<right_width$}",
+        left, middle, right
+    )
+}
+
+fn format_project_refresh(polling: Option<&crate::orchestrator::PollingSnapshot>) -> String {
+    match polling {
+        Some(polling) if polling.checking => "Next refresh: checking now...".to_string(),
+        Some(polling) => match polling.next_poll_in_ms {
+            Some(next_poll_in_ms) => {
+                let seconds = next_poll_in_ms.saturating_add(999) / 1000;
+                format!("Next refresh: {seconds}s")
+            }
+            None => "Next refresh: n/a".to_string(),
+        },
+        None => "Next refresh: n/a".to_string(),
+    }
+}
+
 fn dashboard_url(settings: &Settings) -> Option<String> {
     settings.server.port.map(|port| {
         format!(
@@ -336,20 +587,6 @@ fn dashboard_url(settings: &Settings) -> Option<String> {
 
 fn linear_project_url(project_slug: &str) -> String {
     format!("https://linear.app/project/{project_slug}/issues")
-}
-
-fn format_project_refresh_line(polling: Option<&crate::orchestrator::PollingSnapshot>) -> String {
-    match polling {
-        Some(polling) if polling.checking => "│ Next refresh: checking now...".to_string(),
-        Some(polling) => match polling.next_poll_in_ms {
-            Some(next_poll_in_ms) => {
-                let seconds = next_poll_in_ms.saturating_add(999) / 1000;
-                format!("│ Next refresh: {seconds}s")
-            }
-            None => "│ Next refresh: n/a".to_string(),
-        },
-        None => "│ Next refresh: n/a".to_string(),
-    }
 }
 
 fn dashboard_url_host(host: &str) -> String {
@@ -377,8 +614,8 @@ fn format_rate_limits(rate_limits: Option<&JsonValue>) -> String {
         .unwrap_or_else(|| "n/a".to_string());
     let credits = rate_limits
         .get("credits")
-        .map(format_rate_limit_bucket)
-        .unwrap_or_else(|| "n/a".to_string());
+        .map(format_rate_limit_credits)
+        .unwrap_or_else(|| "credits n/a".to_string());
     format!("{limit_id} | primary {primary} | secondary {secondary} | credits {credits}")
 }
 
@@ -386,6 +623,10 @@ fn format_runtime_seconds(seconds: u64) -> String {
     let minutes = seconds / 60;
     let seconds = seconds % 60;
     format!("{minutes}m {seconds}s")
+}
+
+fn format_tps(value: f64) -> String {
+    format_count(value.max(0.0).trunc() as u64)
 }
 
 fn format_count(value: u64) -> String {
@@ -439,6 +680,34 @@ fn format_rate_limit_bucket(bucket: &JsonValue) -> String {
         };
     }
     sanitize_line(&bucket.to_string())
+}
+
+fn format_rate_limit_credits(credits: &JsonValue) -> String {
+    if credits.is_null() {
+        return "n/a".to_string();
+    }
+    if credits
+        .get("unlimited")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return "unlimited".to_string();
+    }
+    if credits
+        .get("has_credits")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return credits
+            .get("balance")
+            .and_then(as_u64_like)
+            .map(format_count)
+            .unwrap_or_else(|| "available".to_string());
+    }
+    if let Some(balance) = credits.get("balance").and_then(as_u64_like) {
+        return format_count(balance);
+    }
+    "none".to_string()
 }
 
 fn as_u64_like(value: &JsonValue) -> Option<u64> {
@@ -513,6 +782,59 @@ fn format_running_summary(
     format!("│ ● {issue} {state} {pid} {age} {tokens} {session} {event}")
 }
 
+fn render_running_summary_html(
+    entry: &crate::orchestrator::RunningSnapshot,
+    running_event_width: usize,
+) -> String {
+    let issue = format_cell(&entry.identifier, RUNNING_ID_WIDTH, Alignment::Left);
+    let state = format_cell(&entry.state, RUNNING_STAGE_WIDTH, Alignment::Left);
+    let pid = format_cell(
+        entry.codex_app_server_pid.as_deref().unwrap_or("n/a"),
+        RUNNING_PID_WIDTH,
+        Alignment::Left,
+    );
+    let age = format_cell(
+        &format_runtime_and_turns(entry.runtime_seconds, entry.turn_count),
+        RUNNING_AGE_WIDTH,
+        Alignment::Left,
+    );
+    let tokens = format_cell(
+        &format_count(entry.codex_total_tokens),
+        RUNNING_TOKENS_WIDTH,
+        Alignment::Right,
+    );
+    let session = format_cell(
+        &compact_session_id(entry.session_id.as_deref()),
+        RUNNING_SESSION_WIDTH,
+        Alignment::Left,
+    );
+    let event = format_cell(
+        &summarize_message(entry.last_codex_message.as_ref()),
+        running_event_width,
+        Alignment::Left,
+    );
+    let status_class = running_status_class(entry.last_codex_event.as_deref());
+
+    term_line([
+        raw("│ "),
+        term(status_class, "●"),
+        raw(" "),
+        term("term-cyan", &issue),
+        raw(" "),
+        term(status_class, &state),
+        raw(" "),
+        term("term-yellow", &pid),
+        raw(" "),
+        term("term-magenta", &age),
+        raw(" "),
+        term("term-yellow", &tokens),
+        raw(" "),
+        term("term-cyan", &session),
+        raw(" "),
+        term(status_class, &event),
+    ])
+}
+
 fn format_retry_summary(entry: &crate::orchestrator::RetrySnapshot) -> String {
     let identifier = entry.identifier.as_deref().unwrap_or(&entry.issue_id);
     let mut row = format!(
@@ -531,6 +853,27 @@ fn format_retry_summary(entry: &crate::orchestrator::RetrySnapshot) -> String {
     row
 }
 
+fn render_retry_summary_html(entry: &crate::orchestrator::RetrySnapshot) -> String {
+    let identifier = entry.identifier.as_deref().unwrap_or(&entry.issue_id);
+    let mut parts = vec![
+        raw("│  "),
+        term("term-orange", "↻"),
+        raw(" "),
+        term("term-red", identifier),
+        raw(" "),
+        term("term-yellow", &format!("attempt={}", entry.attempt)),
+        term("term-dim", " in "),
+        term("term-cyan", &next_in_words(entry.due_in_ms)),
+    ];
+    if let Some(error) = entry.error.as_deref().map(sanitize_line)
+        && !error.is_empty()
+    {
+        parts.push(raw(" "));
+        parts.push(term("term-dim", &format!("error={}", truncate(&error, 96))));
+    }
+    term_line(parts)
+}
+
 fn next_in_words(due_in_ms: u64) -> String {
     let secs = due_in_ms / 1000;
     let millis = due_in_ms % 1000;
@@ -538,7 +881,11 @@ fn next_in_words(due_in_ms: u64) -> String {
 }
 
 fn format_runtime_and_turns(seconds: u64, turn_count: u64) -> String {
-    format!("{} / {}", format_runtime_seconds(seconds), turn_count)
+    if turn_count > 0 {
+        format!("{} / {}", format_runtime_seconds(seconds), turn_count)
+    } else {
+        format_runtime_seconds(seconds)
+    }
 }
 
 fn compact_session_id(session_id: Option<&str>) -> String {
@@ -607,6 +954,38 @@ fn truncate_plain(value: &str, width: usize) -> String {
     let mut truncated = value.chars().take(width - 3).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn running_status_class(event: Option<&str>) -> &'static str {
+    match event {
+        None => "term-red",
+        Some("codex/event/token_count") => "term-yellow",
+        Some("codex/event/task_started") => "term-green",
+        Some("turn_completed") => "term-magenta",
+        _ => "term-blue",
+    }
+}
+
+fn term(class: &str, value: &str) -> String {
+    format!("<span class=\"{class}\">{}</span>", escape_html(value))
+}
+
+fn raw(value: &str) -> String {
+    escape_html(value)
+}
+
+fn term_line<I>(parts: I) -> String
+where
+    I: IntoIterator<Item = String>,
+{
+    parts.into_iter().collect::<Vec<_>>().join("")
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -716,7 +1095,7 @@ mod tests {
     #[test]
     fn formats_snapshot_content_with_running_and_retry_rows() {
         let rendered =
-            format_snapshot_content_for_test(Some(&snapshot()), &settings(), 42.0, Some(115));
+            format_snapshot_content_for_test(Some(&snapshot()), &settings(), 658_875.2, Some(115));
         assert!(rendered.contains("SYMPHONY STATUS"));
         assert!(rendered.contains("ID       STAGE"));
         assert!(rendered.contains("AGE / TURN"));
@@ -725,9 +1104,22 @@ mod tests {
         assert!(rendered.contains("MT-202"));
         assert!(rendered.contains("approval"));
         assert!(rendered.contains("error=error with newline"));
+        assert!(rendered.contains("Throughput: 658,875 tps"));
         assert!(rendered.contains("https://linear.app/project/demo/issues"));
         assert!(rendered.contains("http://127.0.0.1:4000/"));
         assert!(rendered.contains("1m 30s / 3"));
         assert!(rendered.contains("thread-1-turn-1") || rendered.contains("thre...turn-1"));
+    }
+
+    #[test]
+    fn renders_terminal_html_with_semantic_color_classes() {
+        let rendered =
+            render_snapshot_html_for_test(Some(&snapshot()), &settings(), 658_875.2, Some(115));
+        assert!(rendered.contains("term-strong"));
+        assert!(rendered.contains("term-green"));
+        assert!(rendered.contains("term-yellow"));
+        assert!(rendered.contains("term-cyan"));
+        assert!(rendered.contains("MT-101"));
+        assert!(rendered.contains("Backoff queue"));
     }
 }

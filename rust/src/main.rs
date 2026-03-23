@@ -219,8 +219,20 @@ fn colorize_line(line: &str) -> String {
             line_tail(line)
         );
     }
+    if line.contains("Rate Limits:") && line.contains("Agents:") && line.contains("Throughput:") {
+        return format!("{ANSI_BOLD}│ {ANSI_GREEN}{line}{ANSI_RESET}");
+    }
+    if line.contains("Agents:") && line.contains("Throughput:") && line.contains("Runtime:") {
+        return format!("{ANSI_BOLD}│ {ANSI_CYAN}{line}{ANSI_RESET}");
+    }
+    if line.contains("Tokens:") && line.contains("Rate Limits:") {
+        return format!("{ANSI_BOLD}│ {ANSI_YELLOW}{line}{ANSI_RESET}");
+    }
     if line.starts_with("│ Project: ") || line.starts_with("│ Dashboard: ") {
         return format!("{ANSI_BOLD}│ {ANSI_CYAN}{}{ANSI_RESET}", &line[2..]);
+    }
+    if line.contains("│ Status unknown") {
+        return format!("{ANSI_BOLD}{ANSI_YELLOW}{} {ANSI_RESET}", line);
     }
     if line.starts_with("│ Next refresh: ") {
         return format!(
@@ -229,6 +241,9 @@ fn colorize_line(line: &str) -> String {
         );
     }
     if line.starts_with("├─ Running") || line.starts_with("├─ Backoff queue") {
+        return format!("{ANSI_BOLD}{line}{ANSI_RESET}");
+    }
+    if line.starts_with("├─ Status") {
         return format!("{ANSI_BOLD}{line}{ANSI_RESET}");
     }
     if line.starts_with("│ ● ") {
