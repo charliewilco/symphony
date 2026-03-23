@@ -1679,7 +1679,7 @@ mod tests {
         second.priority = Some(1);
         second.created_at = Some(timestamp);
 
-        let mut issues = vec![first.clone(), second.clone()];
+        let mut issues = [first.clone(), second.clone()];
         issues.sort_by_key(issue_dispatch_sort_key);
 
         assert_eq!(issues[0].identifier, "MT-1");
