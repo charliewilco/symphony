@@ -1,14 +1,14 @@
 [package]
-name = "symphony-rust"
+name = "rsymphony"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "symphony_rust"
+name = "rsymphony"
 path = "src/lib.rs"
 
 [[bin]]
-name = "symphony"
+name = "rsymphony"
 path = "src/main.rs"
 
 [dependencies]

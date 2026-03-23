@@ -1,0 +1,29 @@
+set shell := ["zsh", "-cu"]
+
+default:
+    just check
+
+fmt:
+    cargo fmt
+
+fmt-check:
+    cargo fmt --check
+
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+test:
+    cargo test
+
+check: fmt-check clippy test
+
+build:
+    cargo build --release --bin rsymphony
+
+run workflow="./WORKFLOW.md":
+    cargo run --bin rsymphony -- --i-understand-that-this-will-be-running-without-the-usual-guardrails {{workflow}}
+
+install:
+    cargo install --path . --bin rsymphony --force
+
+alias i := install

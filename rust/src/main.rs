@@ -2,17 +2,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use symphony_rust::config::{CliOverrides, Settings};
-use symphony_rust::http;
-use symphony_rust::log_file;
-use symphony_rust::orchestrator::OrchestratorRuntime;
-use symphony_rust::workflow::{load, workflow_file_path};
-use symphony_rust::workflow_store::WorkflowStore;
+use rsymphony::config::{CliOverrides, Settings};
+use rsymphony::http;
+use rsymphony::log_file;
+use rsymphony::orchestrator::OrchestratorRuntime;
+use rsymphony::workflow::{load, workflow_file_path};
+use rsymphony::workflow_store::WorkflowStore;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Parser)]
-#[command(name = "symphony")]
+#[command(name = "rsymphony")]
 #[command(about = "Symphony in Rust")]
 struct Args {
     #[arg(long = "i-understand-that-this-will-be-running-without-the-usual-guardrails")]
