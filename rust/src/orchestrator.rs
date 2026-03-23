@@ -45,8 +45,6 @@ pub struct OrchestratorState {
     pub retry_attempts: HashMap<String, RetryEntry>,
     pub codex_totals: TokenTotals,
     pub codex_rate_limits: Option<JsonValue>,
-    pub refresh_pending: bool,
-    pub refresh_coalesced: bool,
     retry_token_counter: u64,
 }
 
@@ -242,14 +240,17 @@ impl OrchestratorRuntime {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.refresh_settings().await?;
-                    self.handle_tick().await?;
+                    self.handle_tick().await;
                 }
                 Some(worker_event) = self.worker_events_rx.recv() => {
-                    self.handle_worker_event(worker_event).await?;
+                    if let Err(error) = self.handle_worker_event(worker_event).await {
+                        tracing::error!("Orchestrator worker event failed: {error}");
+                    }
                 }
                 Some(command) = self.command_rx.recv() => {
-                    self.handle_command(command).await?;
+                    if let Err(error) = self.handle_command(command).await {
+                        tracing::error!("Orchestrator command failed: {error}");
+                    }
                 }
             }
         }
@@ -294,9 +295,14 @@ impl OrchestratorRuntime {
         }
     }
 
-    async fn handle_tick(&mut self) -> Result<()> {
-        let settings =
-            Settings::from_workflow(&self.workflow_store.current().await, &self.overrides)?;
+    async fn handle_tick(&mut self) {
+        if let Err(error) = self.handle_tick_inner().await {
+            tracing::error!("Orchestrator tick failed: {error}");
+        }
+    }
+
+    async fn handle_tick_inner(&mut self) -> Result<()> {
+        let settings = self.refresh_settings().await?;
         let should_poll = {
             let mut state = self.state.lock().await;
             let now = now_millis();
@@ -312,22 +318,28 @@ impl OrchestratorRuntime {
             return Ok(());
         }
 
-        self.reconcile_running_issues(&settings).await?;
-        self.dispatch_ready_retries(&settings).await?;
-        self.dispatch_candidate_issues(&settings).await?;
+        let result = async {
+            self.reconcile_running_issues(&settings).await?;
+            self.dispatch_ready_retries(&settings).await?;
+            self.dispatch_candidate_issues(&settings).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
 
-        let mut state = self.state.lock().await;
-        state.poll_check_in_progress = false;
-        state.next_poll_due_at_ms = Some(now_millis() + settings.polling.interval_ms);
-        state.refresh_pending = false;
-        Ok(())
+        {
+            let mut state = self.state.lock().await;
+            state.poll_check_in_progress = false;
+            state.next_poll_due_at_ms = Some(now_millis() + settings.polling.interval_ms);
+        }
+
+        result
     }
 
     async fn dispatch_candidate_issues(&mut self, settings: &Settings) -> Result<()> {
         settings.validate()?;
         let tracker = tracker_for_settings(settings);
         let mut issues = tracker.fetch_candidate_issues(settings).await?;
-        issues.sort_by_key(|issue| (issue.priority.unwrap_or(i64::MAX), issue.created_at));
+        issues.sort_by_key(issue_dispatch_sort_key);
         for issue in issues {
             if !self.should_dispatch_issue(&issue, settings).await {
                 continue;
@@ -455,6 +467,8 @@ impl OrchestratorRuntime {
                 } else if !active_state(issue, settings) || !issue_routable_to_worker(issue) {
                     self.terminate_running_issue(&issue_id, false, settings)
                         .await;
+                } else {
+                    self.refresh_running_issue_state(issue.clone()).await;
                 }
             } else {
                 self.terminate_running_issue(&issue_id, false, settings)
@@ -849,9 +863,12 @@ impl OrchestratorRuntime {
             OrchestratorCommand::RequestRefresh { reply } => {
                 let payload = {
                     let mut state = self.state.lock().await;
-                    let coalesced = state.poll_check_in_progress || state.refresh_pending;
-                    state.refresh_pending = true;
-                    state.next_poll_due_at_ms = Some(now_millis());
+                    let now = now_millis();
+                    let coalesced = state.poll_check_in_progress
+                        || state.next_poll_due_at_ms.is_some_and(|due| due <= now);
+                    if !coalesced {
+                        state.next_poll_due_at_ms = Some(now);
+                    }
                     RefreshPayload {
                         queued: true,
                         coalesced,
@@ -929,6 +946,13 @@ impl OrchestratorRuntime {
                     .map(|due_at| due_at.saturating_sub(now_ms)),
                 poll_interval_ms: state.poll_interval_ms,
             },
+        }
+    }
+
+    async fn refresh_running_issue_state(&mut self, issue: Issue) {
+        let mut state = self.state.lock().await;
+        if let Some(entry) = state.running.get_mut(&issue.id) {
+            entry.issue = issue;
         }
     }
 }
@@ -1122,6 +1146,18 @@ fn retry_candidate_issue(issue: &Issue, settings: &Settings) -> bool {
         && !todo_issue_blocked_by_non_terminal(issue, settings)
 }
 
+fn issue_dispatch_sort_key(issue: &Issue) -> (i64, i64, String, String) {
+    (
+        issue.priority.unwrap_or(i64::MAX),
+        issue
+            .created_at
+            .map(|created_at| created_at.timestamp_micros())
+            .unwrap_or(i64::MAX),
+        issue.identifier.clone(),
+        issue.id.clone(),
+    )
+}
+
 fn todo_issue_blocked_by_non_terminal(issue: &Issue, settings: &Settings) -> bool {
     normalize_issue_state(&issue.state) == "todo"
         && issue.blocked_by.iter().any(|blocker| {
@@ -1221,6 +1257,9 @@ mod tests {
     use crate::tracker::Issue;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
+    use tempfile::tempdir;
+    use tokio::sync::{Mutex, mpsc};
 
     fn issue() -> Issue {
         Issue {
@@ -1264,6 +1303,32 @@ mod tests {
             worker_host: worker_host.map(ToString::to_string),
             task: tokio::spawn(async {}),
             attempt: None,
+        }
+    }
+
+    async fn test_runtime_with_workflow(workflow_yaml: &str) -> OrchestratorRuntime {
+        let dir = tempdir().unwrap();
+        let workflow_root = dir.keep();
+        let workflow_path = workflow_root.join("WORKFLOW.md");
+        fs::write(&workflow_path, workflow_yaml).unwrap();
+        let workflow_store = WorkflowStore::new(workflow_path).await.unwrap();
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (worker_events_tx, worker_events_rx) = mpsc::channel(4);
+
+        OrchestratorRuntime {
+            state: std::sync::Arc::new(Mutex::new(OrchestratorState {
+                poll_interval_ms: 30_000,
+                max_concurrent_agents: 10,
+                max_retry_backoff_ms: 300_000,
+                next_poll_due_at_ms: Some(now_millis()),
+                ..OrchestratorState::default()
+            })),
+            command_tx,
+            workflow_store,
+            overrides: CliOverrides::default(),
+            worker_events_tx,
+            worker_events_rx,
+            command_rx,
         }
     }
 
@@ -1534,5 +1599,90 @@ mod tests {
         let mut valid = issue();
         valid.state = "In Progress".to_string();
         assert!(retry_candidate_issue(&valid, &settings));
+    }
+
+    #[tokio::test]
+    async fn handle_tick_survives_workflow_reload_failure() {
+        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+
+        let workflow_path = runtime.workflow_store.path().await;
+        fs::remove_file(workflow_path).unwrap();
+
+        runtime.handle_tick().await;
+
+        let state = runtime.state.lock().await;
+        assert!(!state.poll_check_in_progress);
+    }
+
+    #[tokio::test]
+    async fn refresh_running_issue_state_updates_the_stored_issue() {
+        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+        let mut running_issue = issue();
+        running_issue.state = "In Progress".to_string();
+        {
+            let mut state = runtime.state.lock().await;
+            state.running.insert(
+                running_issue.id.clone(),
+                running_entry(running_issue.clone(), None),
+            );
+        }
+
+        let mut refreshed_issue = running_issue.clone();
+        refreshed_issue.state = "Blocked".to_string();
+        refreshed_issue.title = "Refreshed".to_string();
+
+        runtime
+            .refresh_running_issue_state(refreshed_issue.clone())
+            .await;
+
+        let state = runtime.state.lock().await;
+        let stored = state.running.get(&running_issue.id).unwrap();
+        assert_eq!(stored.issue.state, "Blocked");
+        assert_eq!(stored.issue.title, "Refreshed");
+    }
+
+    #[tokio::test]
+    async fn request_refresh_reports_coalesced_when_poll_is_already_due() {
+        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+        {
+            let mut state = runtime.state.lock().await;
+            state.poll_check_in_progress = false;
+            state.next_poll_due_at_ms = Some(now_millis().saturating_sub(1));
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .handle_command(OrchestratorCommand::RequestRefresh { reply: reply_tx })
+            .await
+            .unwrap();
+
+        let payload = reply_rx.await.unwrap();
+        assert!(payload.coalesced);
+        assert_eq!(
+            payload.operations,
+            vec!["poll".to_string(), "reconcile".to_string()]
+        );
+    }
+
+    #[test]
+    fn dispatch_sort_is_stable_for_equal_priority_and_timestamp() {
+        let timestamp = Utc::now();
+        let mut first = issue();
+        first.id = "issue-a".to_string();
+        first.identifier = "MT-2".to_string();
+        first.priority = Some(1);
+        first.created_at = Some(timestamp);
+
+        let mut second = issue();
+        second.id = "issue-b".to_string();
+        second.identifier = "MT-1".to_string();
+        second.priority = Some(1);
+        second.created_at = Some(timestamp);
+
+        let mut issues = [first.clone(), second.clone()];
+        issues.sort_by_key(issue_dispatch_sort_key);
+
+        assert_eq!(issues[0].identifier, "MT-1");
+        assert_eq!(issues[1].identifier, "MT-2");
     }
 }
