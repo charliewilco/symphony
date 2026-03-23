@@ -228,8 +228,11 @@ fn colorize_line(line: &str) -> String {
     if line.contains("Tokens:") && line.contains("Rate Limits:") {
         return format!("{ANSI_BOLD}│ {ANSI_YELLOW}{line}{ANSI_RESET}");
     }
-    if line.starts_with("│ Project: ") || line.starts_with("│ Dashboard: ") {
-        return format!("{ANSI_BOLD}│ {ANSI_CYAN}{}{ANSI_RESET}", &line[2..]);
+    if let Some(rest) = line.strip_prefix("│ Project: ") {
+        return format!("{ANSI_BOLD}│ {ANSI_CYAN}{}{ANSI_RESET}", rest);
+    }
+    if let Some(rest) = line.strip_prefix("│ Dashboard: ") {
+        return format!("{ANSI_BOLD}│ {ANSI_CYAN}{}{ANSI_RESET}", rest);
     }
     if line.contains("│ Status unknown") {
         return format!("{ANSI_BOLD}{ANSI_YELLOW}{} {ANSI_RESET}", line);
