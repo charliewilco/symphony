@@ -597,8 +597,12 @@ func (rt *OrchestratorRuntime) handleWorkerEvent(ctx context.Context, event agen
 				entry.CodexAppServerPID = update.CodexAppServerPID
 			}
 
-			// Token accounting from payload
+			// Token accounting and rate limits from payload
 			rt.processTokenUpdate(entry, update)
+			if update.RateLimits != nil {
+				raw, _ := json.Marshal(update.RateLimits)
+				rt.state.CodexRateLimits = json.RawMessage(raw)
+			}
 
 			if update.Event == "session_started" {
 				entry.TurnCount++

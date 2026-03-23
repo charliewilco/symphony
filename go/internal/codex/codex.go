@@ -22,11 +22,12 @@ const nonInteractiveToolInputAnswer = "This is a non-interactive session. Operat
 
 // CodexUpdate represents a status update from the codex process.
 type CodexUpdate struct {
-	Event              string    `json:"event"`
-	Timestamp          time.Time `json:"timestamp"`
-	Payload            any       `json:"payload"`
-	SessionID          string    `json:"session_id,omitempty"`
-	CodexAppServerPID  string    `json:"codex_app_server_pid,omitempty"`
+	Event             string          `json:"event"`
+	Timestamp         time.Time       `json:"timestamp"`
+	Payload           any             `json:"payload"`
+	SessionID         string          `json:"session_id,omitempty"`
+	CodexAppServerPID string          `json:"codex_app_server_pid,omitempty"`
+	RateLimits        map[string]any  `json:"rate_limits,omitempty"`
 }
 
 // TurnResult holds the result of completing a turn.
@@ -566,11 +567,66 @@ func toolRequestUserInputUnavailableAnswers(params map[string]any) []map[string]
 }
 
 func sendUpdate(ch chan<- CodexUpdate, update CodexUpdate) {
+	if update.RateLimits == nil {
+		update.RateLimits = ExtractRateLimits(update.Payload)
+	}
 	select {
 	case ch <- update:
 	default:
 		// Drop if channel is full
 	}
+}
+
+// ExtractRateLimits searches a payload for a rate-limits map, matching the
+// Rust extract_rate_limits heuristic: look for an object with limit_id/limit_name
+// and at least one of primary/secondary/credits.
+func ExtractRateLimits(payload any) map[string]any {
+	return rateLimitsFromPayload(payload)
+}
+
+func rateLimitsFromPayload(v any) map[string]any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		if arr, ok := v.([]any); ok {
+			for _, item := range arr {
+				if rl := rateLimitsFromPayload(item); rl != nil {
+					return rl
+				}
+			}
+		}
+		return nil
+	}
+	// Direct rate_limits key
+	if direct, ok := m["rate_limits"]; ok {
+		if rl := rateLimitsFromPayload(direct); rl != nil {
+			return rl
+		}
+	}
+	// This object itself looks like a rate limits map
+	if isRateLimitsMap(m) {
+		return m
+	}
+	// Recurse into values
+	for _, val := range m {
+		if rl := rateLimitsFromPayload(val); rl != nil {
+			return rl
+		}
+	}
+	return nil
+}
+
+func isRateLimitsMap(m map[string]any) bool {
+	_, hasLimitID := m["limit_id"]
+	_, hasLimitName := m["limit_name"]
+	if !hasLimitID && !hasLimitName {
+		return false
+	}
+	for _, bucket := range []string{"primary", "secondary", "credits"} {
+		if _, ok := m[bucket]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func jsonPointerStr(m map[string]any, keys ...string) string {

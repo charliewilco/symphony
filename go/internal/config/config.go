@@ -469,8 +469,10 @@ func DefaultPromptTemplate() string {
 }
 
 // RenderPrompt renders the prompt template with issue and attempt data.
+// Uses strict variable checking per §5.4: unknown variables fail rendering.
 func RenderPrompt(template string, issueObj map[string]any, attempt *int) (string, error) {
 	engine := liquid.NewEngine()
+	engine.StrictVariables()
 	bindings := map[string]any{
 		"issue": issueObj,
 	}
