@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn parses_defaults() {
         let settings = Settings::from_workflow(
-            &config_value("tracker:\n  kind: linear\n  project_slug: test\n"),
+            &config_value("tracker:\n  kind: memory\n"),
             &CliOverrides::default(),
         )
         .unwrap();
@@ -574,6 +574,19 @@ mod tests {
         assert_eq!(settings.polling.interval_ms, 30_000);
         assert_eq!(settings.agent.max_turns, 20);
         assert_eq!(settings.tracker.active_states, vec!["Todo", "In Progress"]);
+    }
+
+    #[test]
+    fn linear_tracker_requires_token() {
+        let err = Settings::from_workflow(
+            &config_value(
+                "tracker:\n  kind: linear\n  project_slug: test\n  api_key: ${LINEAR_API_KEY_MISSING}\n",
+            ),
+            &CliOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("missing_linear_api_token"));
     }
 
     #[test]
