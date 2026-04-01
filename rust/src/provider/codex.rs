@@ -1,13 +1,13 @@
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::{Value as JsonValue, json};
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use super::{AgentUpdate, TurnResult, validate_workspace_cwd};
 use crate::config::Settings;
 use crate::dynamic_tool;
 use crate::ssh;
@@ -15,15 +15,6 @@ use crate::tracker::Issue;
 
 const NON_INTERACTIVE_TOOL_INPUT_ANSWER: &str =
     "This is a non-interactive session. Operator input is unavailable.";
-
-#[derive(Clone, Debug)]
-pub struct CodexUpdate {
-    pub event: String,
-    pub timestamp: DateTime<Utc>,
-    pub payload: JsonValue,
-    pub session_id: Option<String>,
-    pub codex_app_server_pid: Option<String>,
-}
 
 pub struct AppServerSession {
     child: Child,
@@ -34,14 +25,7 @@ pub struct AppServerSession {
     auto_approve_requests: bool,
     approval_policy: JsonValue,
     turn_sandbox_policy: JsonValue,
-    codex_app_server_pid: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TurnResult {
-    pub session_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
+    provider_pid: Option<String>,
 }
 
 pub async fn start_session(
@@ -56,13 +40,13 @@ pub async fn start_session(
             &format!(
                 "cd {} && exec {}",
                 ssh::shell_escape(&workspace),
-                settings.codex.command
+                settings.provider.codex.command
             ),
         )?,
         None => {
             let mut command = Command::new("bash");
             command.kill_on_drop(true);
-            command.arg("-lc").arg(&settings.codex.command);
+            command.arg("-lc").arg(&settings.provider.codex.command);
             command.current_dir(&workspace);
             command.stdin(Stdio::piped());
             command.stdout(Stdio::piped());
@@ -90,12 +74,12 @@ pub async fn start_session(
         stdout: BufReader::new(stdout),
         thread_id: String::new(),
         workspace: workspace.clone(),
-        auto_approve_requests: settings.codex.approval_policy
+        auto_approve_requests: settings.provider.codex.approval_policy
             == JsonValue::String("never".to_string()),
-        approval_policy: settings.codex.approval_policy.clone(),
+        approval_policy: settings.provider.codex.approval_policy.clone(),
         turn_sandbox_policy: settings
             .default_turn_sandbox_policy(Some(std::path::Path::new(&workspace))),
-        codex_app_server_pid: pid,
+        provider_pid: pid,
     };
 
     send_message(
@@ -128,7 +112,7 @@ pub async fn start_session(
             "id": 2,
             "params": {
                 "approvalPolicy": session.approval_policy,
-                "sandbox": settings.codex.thread_sandbox,
+                "sandbox": settings.provider.codex.thread_sandbox,
                 "cwd": workspace,
                 "dynamicTools": dynamic_tool::tool_specs()
             }
@@ -149,7 +133,7 @@ pub async fn run_turn(
     prompt: &str,
     issue: &Issue,
     settings: &Settings,
-    updates_tx: &mpsc::Sender<CodexUpdate>,
+    updates_tx: &mpsc::Sender<AgentUpdate>,
 ) -> Result<TurnResult> {
     send_message(
         &mut session.stdin,
@@ -176,7 +160,8 @@ pub async fn run_turn(
         .to_string();
     let session_id = format!("{}-{turn_id}", session.thread_id);
     let _ = updates_tx
-        .send(CodexUpdate {
+        .send(AgentUpdate {
+            provider: crate::config::ProviderKind::Codex,
             event: "session_started".to_string(),
             timestamp: Utc::now(),
             payload: json!({
@@ -185,14 +170,16 @@ pub async fn run_turn(
                 "session_id": session_id
             }),
             session_id: Some(session_id.clone()),
-            codex_app_server_pid: session.codex_app_server_pid.clone(),
+            provider_pid: session.provider_pid.clone(),
+            usage: None,
+            rate_limits: None,
         })
         .await;
 
     loop {
         let mut line = String::new();
         let read = timeout(
-            std::time::Duration::from_millis(settings.codex.turn_timeout_ms),
+            std::time::Duration::from_millis(settings.provider.turn_timeout_ms),
             session.stdout.read_line(&mut line),
         )
         .await
@@ -212,12 +199,15 @@ pub async fn run_turn(
                 log_non_json_stream_line(trimmed, "turn stream");
                 if protocol_message_candidate(trimmed) {
                     let _ = updates_tx
-                        .send(CodexUpdate {
+                        .send(AgentUpdate {
+                            provider: crate::config::ProviderKind::Codex,
                             event: "malformed".to_string(),
                             timestamp: Utc::now(),
                             payload: JsonValue::String(trimmed.to_string()),
                             session_id: Some(session_id.clone()),
-                            codex_app_server_pid: session.codex_app_server_pid.clone(),
+                            provider_pid: session.provider_pid.clone(),
+                            usage: None,
+                            rate_limits: None,
                         })
                         .await;
                 }
@@ -229,18 +219,21 @@ pub async fn run_turn(
             match method {
                 "turn/completed" => {
                     let _ = updates_tx
-                        .send(CodexUpdate {
+                        .send(AgentUpdate {
+                            provider: crate::config::ProviderKind::Codex,
                             event: "turn_completed".to_string(),
                             timestamp: Utc::now(),
                             payload: payload.clone(),
                             session_id: Some(session_id.clone()),
-                            codex_app_server_pid: session.codex_app_server_pid.clone(),
+                            provider_pid: session.provider_pid.clone(),
+                            usage: None,
+                            rate_limits: None,
                         })
                         .await;
                     return Ok(TurnResult {
-                        session_id,
-                        thread_id: session.thread_id.clone(),
-                        turn_id,
+                        session_id: Some(session_id),
+                        thread_id: Some(session.thread_id.clone()),
+                        turn_id: Some(turn_id),
                     });
                 }
                 method if needs_input(method, &payload) => {
@@ -275,7 +268,8 @@ pub async fn run_turn(
                             _ => "unsupported_tool_call",
                         };
                         let _ = updates_tx
-                            .send(CodexUpdate {
+                            .send(AgentUpdate {
+                                provider: crate::config::ProviderKind::Codex,
                                 event: event.to_string(),
                                 timestamp: Utc::now(),
                                 payload: json!({
@@ -283,7 +277,9 @@ pub async fn run_turn(
                                     "raw": trimmed
                                 }),
                                 session_id: Some(session_id.clone()),
-                                codex_app_server_pid: session.codex_app_server_pid.clone(),
+                                provider_pid: session.provider_pid.clone(),
+                                usage: None,
+                                rate_limits: None,
                             })
                             .await;
                     }
@@ -303,7 +299,8 @@ pub async fn run_turn(
                         )
                         .await?;
                         let _ = updates_tx
-                            .send(CodexUpdate {
+                            .send(AgentUpdate {
+                                provider: crate::config::ProviderKind::Codex,
                                 event: "approval_auto_approved".to_string(),
                                 timestamp: Utc::now(),
                                 payload: json!({
@@ -312,7 +309,9 @@ pub async fn run_turn(
                                     "decision": decision
                                 }),
                                 session_id: Some(session_id.clone()),
-                                codex_app_server_pid: session.codex_app_server_pid.clone(),
+                                provider_pid: session.provider_pid.clone(),
+                                usage: None,
+                                rate_limits: None,
                             })
                             .await;
                         continue;
@@ -327,7 +326,8 @@ pub async fn run_turn(
                     )
                     .await?;
                     let _ = updates_tx
-                        .send(CodexUpdate {
+                        .send(AgentUpdate {
+                            provider: crate::config::ProviderKind::Codex,
                             event: "tool_input_auto_answered".to_string(),
                             timestamp: Utc::now(),
                             payload: json!({
@@ -336,7 +336,9 @@ pub async fn run_turn(
                                 "answer": NON_INTERACTIVE_TOOL_INPUT_ANSWER
                             }),
                             session_id: Some(session_id.clone()),
-                            codex_app_server_pid: session.codex_app_server_pid.clone(),
+                            provider_pid: session.provider_pid.clone(),
+                            usage: None,
+                            rate_limits: None,
                         })
                         .await;
                 }
@@ -353,7 +355,8 @@ pub async fn run_turn(
                             )
                             .await?;
                             let _ = updates_tx
-                                .send(CodexUpdate {
+                                .send(AgentUpdate {
+                                    provider: crate::config::ProviderKind::Codex,
                                     event: "approval_auto_approved".to_string(),
                                     timestamp: Utc::now(),
                                     payload: json!({
@@ -362,7 +365,9 @@ pub async fn run_turn(
                                         "decision": decision
                                     }),
                                     session_id: Some(session_id.clone()),
-                                    codex_app_server_pid: session.codex_app_server_pid.clone(),
+                                    provider_pid: session.provider_pid.clone(),
+                                    usage: None,
+                                    rate_limits: None,
                                 })
                                 .await;
                         }
@@ -372,73 +377,21 @@ pub async fn run_turn(
                 }
                 _ => {
                     let _ = updates_tx
-                        .send(CodexUpdate {
+                        .send(AgentUpdate {
+                            provider: crate::config::ProviderKind::Codex,
                             event: "notification".to_string(),
                             timestamp: Utc::now(),
                             payload: payload.clone(),
                             session_id: Some(session_id.clone()),
-                            codex_app_server_pid: session.codex_app_server_pid.clone(),
+                            provider_pid: session.provider_pid.clone(),
+                            usage: None,
+                            rate_limits: None,
                         })
                         .await;
                 }
             }
         }
     }
-}
-
-fn validate_workspace_cwd(
-    workspace: &str,
-    worker_host: Option<&str>,
-    settings: &Settings,
-) -> Result<String> {
-    match worker_host {
-        Some(_) => {
-            if workspace.trim().is_empty() {
-                bail!("invalid_workspace_cwd: empty_remote_workspace");
-            }
-            if workspace.contains(['\n', '\r', '\0']) {
-                bail!("invalid_workspace_cwd: invalid_remote_workspace");
-            }
-            Ok(workspace.to_string())
-        }
-        None => validate_local_workspace_cwd(workspace, settings),
-    }
-}
-
-fn validate_local_workspace_cwd(workspace: &str, settings: &Settings) -> Result<String> {
-    let expanded_workspace = PathBuf::from(workspace);
-    let expanded_root = settings.workspace.root.clone();
-    let canonical_workspace = expanded_workspace
-        .canonicalize()
-        .map_err(|error| anyhow!("invalid_workspace_cwd: path_unreadable: {error}"))?;
-    let canonical_root = expanded_root
-        .canonicalize()
-        .map_err(|error| anyhow!("invalid_workspace_cwd: path_unreadable: {error}"))?;
-
-    if canonical_workspace == canonical_root {
-        bail!(
-            "invalid_workspace_cwd: workspace_root: {}",
-            canonical_workspace.display()
-        );
-    }
-
-    if canonical_workspace.starts_with(&canonical_root) {
-        return Ok(canonical_workspace.to_string_lossy().to_string());
-    }
-
-    if Path::new(workspace).starts_with(&expanded_root) {
-        bail!(
-            "invalid_workspace_cwd: symlink_escape: {} {}",
-            workspace,
-            canonical_root.display()
-        );
-    }
-
-    bail!(
-        "invalid_workspace_cwd: outside_workspace_root: {} {}",
-        canonical_workspace.display(),
-        canonical_root.display()
-    );
 }
 
 pub async fn stop_session(mut session: AppServerSession) -> Result<()> {
@@ -465,11 +418,11 @@ async fn await_response(
     loop {
         let mut line = String::new();
         let read = timeout(
-            std::time::Duration::from_millis(settings.codex.read_timeout_ms),
+            std::time::Duration::from_millis(settings.provider.read_timeout_ms),
             stdout.read_line(&mut line),
         )
         .await
-        .map_err(|_| anyhow!("codex_read_timeout"))??;
+        .map_err(|_| anyhow!("provider_read_timeout"))??;
         if read == 0 {
             bail!("port_exit");
         }
@@ -777,6 +730,7 @@ mod tests {
     use crate::config::{Settings, settings_from_toml_str};
     use crate::tracker::Issue;
     use serde_json::json;
+    use std::path::Path;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -962,7 +916,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.turn_id, "turn-89");
+        assert_eq!(result.turn_id.as_deref(), Some("turn-89"));
 
         let trace = std::fs::read_to_string(trace_file).unwrap();
         assert!(trace.contains("\"id\":99"));

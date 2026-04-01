@@ -1,8 +1,8 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::codex::{self, CodexUpdate};
 use crate::config::{Settings, default_prompt_template, render_prompt};
+use crate::provider::{self, AgentUpdate};
 use crate::tracker::{Issue, Tracker};
 use crate::workspace;
 
@@ -18,9 +18,9 @@ pub enum WorkerEvent {
         issue_id: String,
         runtime: WorkerRuntimeInfo,
     },
-    CodexUpdate {
+    AgentUpdate {
         issue_id: String,
-        update: CodexUpdate,
+        update: AgentUpdate,
     },
     Exit {
         issue_id: String,
@@ -79,7 +79,7 @@ async fn run_inner(
 
     workspace::run_before_run_hook(&workspace, &issue.identifier, &settings).await?;
 
-    let mut codex_session = codex::start_session(
+    let mut agent_session = provider::start_session(
         &workspace.path.to_string_lossy(),
         worker_host.as_deref(),
         &settings,
@@ -91,7 +91,7 @@ async fn run_inner(
     tokio::spawn(async move {
         while let Some(update) = updates_rx.recv().await {
             let _ = events_tx
-                .send(WorkerEvent::CodexUpdate {
+                .send(WorkerEvent::AgentUpdate {
                     issue_id: issue_id.clone(),
                     update,
                 })
@@ -112,13 +112,13 @@ async fn run_inner(
             render_prompt(&template, &current_issue, attempt)?
         } else {
             format!(
-                "Continuation guidance:\n\n- The previous Codex turn completed normally, but the Linear issue is still in an active state.\n- This is continuation turn #{turn_number} of {} for the current agent run.\n- Resume from the current workspace and workpad state instead of restarting from scratch.\n- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.\n- Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.",
+                "Continuation guidance:\n\n- The previous agent turn completed normally, but the Linear issue is still in an active state.\n- This is continuation turn #{turn_number} of {} for the current agent run.\n- Resume from the current workspace and workpad state instead of restarting from scratch.\n- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.\n- Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.",
                 settings.agent.max_turns
             )
         };
 
-        codex::run_turn(
-            &mut codex_session,
+        provider::run_turn(
+            &mut agent_session,
             &prompt,
             &current_issue,
             &settings,
@@ -146,7 +146,7 @@ async fn run_inner(
         attempt = Some(attempt.unwrap_or(0) + 1);
     }
 
-    codex::stop_session(codex_session).await?;
+    provider::stop_session(agent_session).await?;
     workspace::run_after_run_hook(&workspace, &current_issue.identifier, &settings).await;
     Ok(())
 }

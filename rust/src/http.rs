@@ -679,7 +679,7 @@ mod tests {
     use tokio::time::sleep;
     use tower::util::ServiceExt;
 
-    use crate::config::CliOverrides;
+    use crate::config::{CliOverrides, ProviderKind};
     use crate::config_store::ConfigStore;
     use crate::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
@@ -740,18 +740,19 @@ mod tests {
                 issue_id: "issue-http".to_string(),
                 identifier: "MT-HTTP".to_string(),
                 state: "In Progress".to_string(),
+                provider_kind: ProviderKind::Codex,
                 worker_host: None,
                 workspace_path: None,
                 session_id: Some("thread-http".to_string()),
-                codex_app_server_pid: None,
-                codex_input_tokens: 4,
-                codex_output_tokens: 8,
-                codex_total_tokens: 12,
+                provider_process_id: None,
+                agent_input_tokens: 4,
+                agent_output_tokens: 8,
+                agent_total_tokens: 12,
                 turn_count: 7,
                 started_at: chrono::Utc::now(),
-                last_codex_timestamp: None,
-                last_codex_message: Some(JsonValue::String("rendered".to_string())),
-                last_codex_event: Some("notification".to_string()),
+                last_agent_timestamp: None,
+                last_agent_message: Some(JsonValue::String("rendered".to_string())),
+                last_agent_event: Some("notification".to_string()),
                 runtime_seconds: 42,
             }],
             retrying: vec![RetrySnapshot {
@@ -763,7 +764,7 @@ mod tests {
                 worker_host: None,
                 workspace_path: None,
             }],
-            codex_totals: TokenTotals {
+            agent_totals: TokenTotals {
                 input_tokens: 4,
                 output_tokens: 8,
                 total_tokens: 12,

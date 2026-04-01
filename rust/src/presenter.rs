@@ -16,7 +16,8 @@ pub fn state_payload(snapshot: Result<&Snapshot, SnapshotError>) -> JsonValue {
             },
             "running": snapshot.running.iter().map(project_running_entry).collect::<Vec<_>>(),
             "retrying": snapshot.retrying.iter().map(project_retry_entry).collect::<Vec<_>>(),
-            "codex_totals": snapshot.codex_totals,
+            "agent_totals": snapshot.agent_totals,
+            "codex_totals": snapshot.agent_totals,
             "rate_limits": snapshot.rate_limits
         }),
         Err(SnapshotError::Timeout) => json!({
@@ -83,7 +84,10 @@ pub fn issue_payload(
         },
         "running": running.map(project_running_issue_body),
         "retry": retry.map(project_retry_issue_body),
-        "logs": { "codex_session_logs": [] },
+        "logs": {
+            "agent_session_logs": [],
+            "codex_session_logs": []
+        },
         "recent_events": running.map(project_recent_events).unwrap_or_else(|| json!([])),
         "last_error": retry.and_then(|entry| entry.error.clone()),
         "tracked": {}
@@ -128,12 +132,12 @@ pub fn render_dashboard_html(snapshot: &Snapshot, settings: &Settings) -> String
     ));
     html.push_str(&format!(
         "<article class=\"metric-card\"><p class=\"metric-label\">Total tokens</p><p class=\"metric-value numeric\">{}</p><p class=\"metric-detail numeric\">In {} / Out {}</p></article>",
-        format_int(snapshot.codex_totals.total_tokens),
-        format_int(snapshot.codex_totals.input_tokens),
-        format_int(snapshot.codex_totals.output_tokens)
+        format_int(snapshot.agent_totals.total_tokens),
+        format_int(snapshot.agent_totals.input_tokens),
+        format_int(snapshot.agent_totals.output_tokens)
     ));
     html.push_str(&format!(
-        "<article class=\"metric-card\"><p class=\"metric-label\">Runtime</p><p class=\"metric-value numeric\">{}</p><p class=\"metric-detail\">Total Codex runtime across completed and active sessions.</p></article>",
+        "<article class=\"metric-card\"><p class=\"metric-label\">Runtime</p><p class=\"metric-value numeric\">{}</p><p class=\"metric-detail\">Total agent runtime across completed and active sessions.</p></article>",
         runtime
     ));
     html.push_str("</section>");
@@ -164,18 +168,19 @@ fn project_running_entry(entry: &RunningSnapshot) -> JsonValue {
         "issue_id": entry.issue_id,
         "issue_identifier": entry.identifier,
         "state": entry.state,
+        "provider_kind": entry.provider_kind,
         "worker_host": entry.worker_host,
         "workspace_path": entry.workspace_path,
         "session_id": entry.session_id,
         "turn_count": entry.turn_count,
-        "last_event": entry.last_codex_event,
-        "last_message": status_dashboard::humanize_codex_message(entry.last_codex_message.as_ref()),
+        "last_event": entry.last_agent_event,
+        "last_message": status_dashboard::humanize_agent_message(entry.last_agent_message.as_ref()),
         "started_at": iso8601(Some(entry.started_at)),
-        "last_event_at": iso8601(entry.last_codex_timestamp),
+        "last_event_at": iso8601(entry.last_agent_timestamp),
         "tokens": {
-            "input_tokens": entry.codex_input_tokens,
-            "output_tokens": entry.codex_output_tokens,
-            "total_tokens": entry.codex_total_tokens
+            "input_tokens": entry.agent_input_tokens,
+            "output_tokens": entry.agent_output_tokens,
+            "total_tokens": entry.agent_total_tokens
         }
     })
 }
@@ -199,14 +204,15 @@ fn project_running_issue_body(entry: &RunningSnapshot) -> JsonValue {
         "session_id": entry.session_id,
         "turn_count": entry.turn_count,
         "state": entry.state,
+        "provider_kind": entry.provider_kind,
         "started_at": iso8601(Some(entry.started_at)),
-        "last_event": entry.last_codex_event,
-        "last_message": status_dashboard::humanize_codex_message(entry.last_codex_message.as_ref()),
-        "last_event_at": iso8601(entry.last_codex_timestamp),
+        "last_event": entry.last_agent_event,
+        "last_message": status_dashboard::humanize_agent_message(entry.last_agent_message.as_ref()),
+        "last_event_at": iso8601(entry.last_agent_timestamp),
         "tokens": {
-            "input_tokens": entry.codex_input_tokens,
-            "output_tokens": entry.codex_output_tokens,
-            "total_tokens": entry.codex_total_tokens
+            "input_tokens": entry.agent_input_tokens,
+            "output_tokens": entry.agent_output_tokens,
+            "total_tokens": entry.agent_total_tokens
         }
     })
 }
@@ -222,11 +228,11 @@ fn project_retry_issue_body(entry: &RetrySnapshot) -> JsonValue {
 }
 
 fn project_recent_events(entry: &RunningSnapshot) -> JsonValue {
-    match entry.last_codex_timestamp {
+    match entry.last_agent_timestamp {
         Some(timestamp) => json!([{
             "at": iso8601(Some(timestamp)),
-            "event": entry.last_codex_event,
-            "message": status_dashboard::humanize_codex_message(entry.last_codex_message.as_ref())
+            "event": entry.last_agent_event,
+            "message": status_dashboard::humanize_agent_message(entry.last_agent_message.as_ref())
         }]),
         None => json!([]),
     }
@@ -262,7 +268,7 @@ fn render_running_rows(snapshot: &Snapshot) -> String {
         concat!(
             "<div class=\"table-wrap\"><table class=\"data-table data-table-running\">",
             "<colgroup><col style=\"width: 12rem;\"><col style=\"width: 9rem;\"><col style=\"width: 10rem;\"><col style=\"width: 9rem;\"><col><col style=\"width: 11rem;\"></colgroup>",
-            "<thead><tr><th>Issue</th><th>State</th><th>Session</th><th>Runtime / turns</th><th>Codex update</th><th>Tokens</th></tr></thead>",
+            "<thead><tr><th>Issue</th><th>State</th><th>Provider</th><th>Session</th><th>Runtime / turns</th><th>Agent update</th><th>Tokens</th></tr></thead>",
             "<tbody>{}</tbody></table></div>"
         ),
         body
@@ -270,16 +276,17 @@ fn render_running_rows(snapshot: &Snapshot) -> String {
 }
 
 fn render_running_row(entry: &RunningSnapshot) -> String {
-    let last_message = status_dashboard::humanize_codex_message(entry.last_codex_message.as_ref());
-    let event = entry.last_codex_event.as_deref().unwrap_or("n/a");
+    let last_message = status_dashboard::humanize_agent_message(entry.last_agent_message.as_ref());
+    let event = entry.last_agent_event.as_deref().unwrap_or("n/a");
     let session = entry.session_id.as_deref().unwrap_or("n/a");
     let session_compact = compact_session_id(entry.session_id.as_deref());
-    let last_event_at = iso8601(entry.last_codex_timestamp).unwrap_or_else(|| "n/a".to_string());
+    let last_event_at = iso8601(entry.last_agent_timestamp).unwrap_or_else(|| "n/a".to_string());
     format!(
         concat!(
             "<tr>",
             "<td class=\"running-col running-col-issue\"><div class=\"issue-stack\"><span class=\"issue-id\">{}</span><a class=\"issue-link\" href=\"/api/v1/{}\">JSON details</a></div></td>",
             "<td class=\"running-col running-col-state\"><span class=\"state-badge {}\">{}</span></td>",
+            "<td class=\"running-col running-col-session\"><span class=\"mono\">{}</span></td>",
             "<td class=\"running-col running-col-session\"><div class=\"session-stack\"><span class=\"mono\" title=\"{}\">{}</span><span class=\"muted\">{}</span></div></td>",
             "<td class=\"running-col running-col-runtime numeric\">{}</td>",
             "<td class=\"running-col running-col-event\"><div class=\"detail-stack\"><span class=\"event-text\" title=\"{}\">{}</span><span class=\"muted event-meta\">{} · <span class=\"mono numeric\">{}</span></span></div></td>",
@@ -290,6 +297,7 @@ fn render_running_row(entry: &RunningSnapshot) -> String {
         escape_html(&entry.identifier),
         state_badge_class(&entry.state),
         escape_html(&entry.state),
+        escape_html(entry.provider_kind.as_str()),
         escape_html(session),
         escape_html(&session_compact),
         escape_html(session),
@@ -301,9 +309,9 @@ fn render_running_row(entry: &RunningSnapshot) -> String {
         escape_html(&last_message),
         escape_html(event),
         escape_html(&last_event_at),
-        format_int(entry.codex_total_tokens),
-        format_int(entry.codex_input_tokens),
-        format_int(entry.codex_output_tokens),
+        format_int(entry.agent_total_tokens),
+        format_int(entry.agent_input_tokens),
+        format_int(entry.agent_output_tokens),
     )
 }
 
@@ -378,7 +386,7 @@ fn format_int(value: u64) -> String {
 }
 
 fn status_dashboard_runtime(snapshot: &Snapshot) -> String {
-    format_runtime_seconds(snapshot.codex_totals.seconds_running)
+    format_runtime_seconds(snapshot.agent_totals.seconds_running)
 }
 
 fn format_runtime_seconds(seconds: u64) -> String {
@@ -430,7 +438,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Settings, settings_from_toml_str};
+    use crate::config::{ProviderKind, Settings, settings_from_toml_str};
     use crate::orchestrator::{PollingSnapshot, TokenTotals};
 
     fn settings() -> Settings {
@@ -443,18 +451,19 @@ mod tests {
                 issue_id: "issue-http".to_string(),
                 identifier: "MT-HTTP".to_string(),
                 state: "In Progress".to_string(),
+                provider_kind: ProviderKind::Codex,
                 worker_host: None,
                 workspace_path: None,
                 session_id: Some("thread-http".to_string()),
-                codex_app_server_pid: None,
-                codex_input_tokens: 4,
-                codex_output_tokens: 8,
-                codex_total_tokens: 12,
+                provider_process_id: None,
+                agent_input_tokens: 4,
+                agent_output_tokens: 8,
+                agent_total_tokens: 12,
                 turn_count: 7,
                 started_at: Utc::now(),
-                last_codex_timestamp: None,
-                last_codex_message: Some(JsonValue::String("rendered".to_string())),
-                last_codex_event: Some("notification".to_string()),
+                last_agent_timestamp: None,
+                last_agent_message: Some(JsonValue::String("rendered".to_string())),
+                last_agent_event: Some("notification".to_string()),
                 runtime_seconds: 42,
             }],
             retrying: vec![RetrySnapshot {
@@ -466,7 +475,7 @@ mod tests {
                 worker_host: None,
                 workspace_path: None,
             }],
-            codex_totals: TokenTotals {
+            agent_totals: TokenTotals {
                 input_tokens: 4,
                 output_tokens: 8,
                 total_tokens: 12,

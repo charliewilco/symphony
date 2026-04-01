@@ -9,9 +9,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent_runner::{self, WorkerEvent};
-use crate::codex::CodexUpdate;
-use crate::config::{CliOverrides, RefreshPayload, Settings, normalize_issue_state};
+use crate::config::{CliOverrides, ProviderKind, RefreshPayload, Settings, normalize_issue_state};
 use crate::config_store::ConfigStore;
+use crate::provider::AgentUpdate;
 use crate::tracker::{Issue, Tracker, tracker_for_settings};
 use crate::workflow_store::WorkflowStore;
 use crate::workspace;
@@ -44,27 +44,28 @@ pub struct OrchestratorState {
     pub running: HashMap<String, RunningEntry>,
     pub claimed: HashSet<String>,
     pub retry_attempts: HashMap<String, RetryEntry>,
-    pub codex_totals: TokenTotals,
-    pub codex_rate_limits: Option<JsonValue>,
+    pub agent_totals: TokenTotals,
+    pub rate_limits: Option<JsonValue>,
     retry_token_counter: u64,
 }
 
 pub struct RunningEntry {
     pub identifier: String,
     pub issue: Issue,
+    pub provider_kind: ProviderKind,
     pub started_at: DateTime<Utc>,
     pub session_id: Option<String>,
-    pub codex_app_server_pid: Option<String>,
-    pub codex_input_tokens: u64,
-    pub codex_output_tokens: u64,
-    pub codex_total_tokens: u64,
-    pub codex_last_reported_input_tokens: u64,
-    pub codex_last_reported_output_tokens: u64,
-    pub codex_last_reported_total_tokens: u64,
+    pub provider_process_id: Option<String>,
+    pub agent_input_tokens: u64,
+    pub agent_output_tokens: u64,
+    pub agent_total_tokens: u64,
+    pub agent_last_reported_input_tokens: u64,
+    pub agent_last_reported_output_tokens: u64,
+    pub agent_last_reported_total_tokens: u64,
     pub turn_count: u64,
-    pub last_codex_timestamp: Option<DateTime<Utc>>,
-    pub last_codex_message: Option<JsonValue>,
-    pub last_codex_event: Option<String>,
+    pub last_agent_timestamp: Option<DateTime<Utc>>,
+    pub last_agent_message: Option<JsonValue>,
+    pub last_agent_event: Option<String>,
     pub runtime_seconds: u64,
     pub workspace_path: Option<String>,
     pub worker_host: Option<String>,
@@ -132,7 +133,7 @@ struct RetryRequest {
 pub struct Snapshot {
     pub running: Vec<RunningSnapshot>,
     pub retrying: Vec<RetrySnapshot>,
-    pub codex_totals: TokenTotals,
+    pub agent_totals: TokenTotals,
     pub rate_limits: Option<JsonValue>,
     pub polling: PollingSnapshot,
 }
@@ -142,18 +143,19 @@ pub struct RunningSnapshot {
     pub issue_id: String,
     pub identifier: String,
     pub state: String,
+    pub provider_kind: ProviderKind,
     pub worker_host: Option<String>,
     pub workspace_path: Option<String>,
     pub session_id: Option<String>,
-    pub codex_app_server_pid: Option<String>,
-    pub codex_input_tokens: u64,
-    pub codex_output_tokens: u64,
-    pub codex_total_tokens: u64,
+    pub provider_process_id: Option<String>,
+    pub agent_input_tokens: u64,
+    pub agent_output_tokens: u64,
+    pub agent_total_tokens: u64,
     pub turn_count: u64,
     pub started_at: DateTime<Utc>,
-    pub last_codex_timestamp: Option<DateTime<Utc>>,
-    pub last_codex_message: Option<JsonValue>,
-    pub last_codex_event: Option<String>,
+    pub last_agent_timestamp: Option<DateTime<Utc>>,
+    pub last_agent_message: Option<JsonValue>,
+    pub last_agent_event: Option<String>,
     pub runtime_seconds: u64,
 }
 
@@ -478,7 +480,7 @@ impl OrchestratorRuntime {
     }
 
     async fn reconcile_stalled_runs(&mut self, settings: &Settings) {
-        if settings.codex.stall_timeout_ms == 0 {
+        if settings.provider.stall_timeout_ms == 0 {
             return;
         }
         let now = Utc::now();
@@ -488,9 +490,9 @@ impl OrchestratorRuntime {
                 .running
                 .iter()
                 .filter_map(|(issue_id, entry)| {
-                    let reference = entry.last_codex_timestamp.unwrap_or(entry.started_at);
+                    let reference = entry.last_agent_timestamp.unwrap_or(entry.started_at);
                     let elapsed = now.signed_duration_since(reference).num_milliseconds();
-                    (elapsed > settings.codex.stall_timeout_ms as i64).then(|| {
+                    (elapsed > settings.provider.stall_timeout_ms as i64).then(|| {
                         (
                             issue_id.clone(),
                             entry.identifier.clone(),
@@ -512,7 +514,7 @@ impl OrchestratorRuntime {
                 attempt,
                 retry_kind: RetryKind::Failure,
                 identifier: Some(identifier),
-                error: Some(format!("stalled for {elapsed_ms}ms without codex activity")),
+                error: Some(format!("stalled for {elapsed_ms}ms without agent activity")),
                 worker_host,
                 workspace_path,
             })
@@ -597,19 +599,20 @@ impl OrchestratorRuntime {
             RunningEntry {
                 identifier: issue.identifier.clone(),
                 issue,
+                provider_kind: settings.provider.kind,
                 started_at: Utc::now(),
                 session_id: None,
-                codex_app_server_pid: None,
-                codex_input_tokens: 0,
-                codex_output_tokens: 0,
-                codex_total_tokens: 0,
-                codex_last_reported_input_tokens: 0,
-                codex_last_reported_output_tokens: 0,
-                codex_last_reported_total_tokens: 0,
+                provider_process_id: None,
+                agent_input_tokens: 0,
+                agent_output_tokens: 0,
+                agent_total_tokens: 0,
+                agent_last_reported_input_tokens: 0,
+                agent_last_reported_output_tokens: 0,
+                agent_last_reported_total_tokens: 0,
                 turn_count: 0,
-                last_codex_timestamp: None,
-                last_codex_message: None,
-                last_codex_event: None,
+                last_agent_timestamp: None,
+                last_agent_message: None,
+                last_agent_event: None,
                 runtime_seconds: 0,
                 workspace_path: None,
                 worker_host,
@@ -758,8 +761,8 @@ impl OrchestratorRuntime {
                     entry.worker_host = runtime.worker_host;
                 }
             }
-            WorkerEvent::CodexUpdate { issue_id, update } => {
-                self.integrate_codex_update(&issue_id, update).await;
+            WorkerEvent::AgentUpdate { issue_id, update } => {
+                self.integrate_agent_update(&issue_id, update).await;
             }
             WorkerEvent::Exit { issue_id, reason } => {
                 let (identifier, worker_host, workspace_path, next_attempt, started_at) = {
@@ -809,20 +812,23 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
-    async fn integrate_codex_update(&self, issue_id: &str, update: CodexUpdate) {
+    async fn integrate_agent_update(&self, issue_id: &str, update: AgentUpdate) {
         let mut state = self.state.lock().await;
-        let rate_limits = extract_rate_limits(&update.payload);
+        let rate_limits = update
+            .rate_limits
+            .clone()
+            .or_else(|| extract_rate_limits(&update.payload));
         let token_delta = {
             let Some(entry) = state.running.get_mut(issue_id) else {
                 return;
             };
-            entry.last_codex_timestamp = Some(update.timestamp);
-            entry.last_codex_message = Some(json!({
+            entry.last_agent_timestamp = Some(update.timestamp);
+            entry.last_agent_message = Some(json!({
                 "event": update.event,
                 "message": update.payload,
                 "timestamp": update.timestamp,
             }));
-            entry.last_codex_event = Some(update.event.clone());
+            entry.last_agent_event = Some(update.event.clone());
             if let Some(session_id) = update.session_id {
                 let was_new = entry.session_id.as_deref() != Some(&session_id);
                 entry.session_id = Some(session_id);
@@ -830,18 +836,22 @@ impl OrchestratorRuntime {
                     entry.turn_count += 1;
                 }
             }
-            if let Some(pid) = update.codex_app_server_pid {
-                entry.codex_app_server_pid = Some(pid);
+            if let Some(pid) = update.provider_pid {
+                entry.provider_process_id = Some(pid);
             }
-            extract_usage(&update.payload).map(|usage| apply_usage_update(entry, usage))
+            update
+                .usage
+                .map(usage_from_agent_usage)
+                .or_else(|| extract_usage(&update.payload))
+                .map(|usage| apply_usage_update(entry, usage))
         };
         if let Some(delta) = token_delta {
-            state.codex_totals.input_tokens += delta.input_tokens;
-            state.codex_totals.output_tokens += delta.output_tokens;
-            state.codex_totals.total_tokens += delta.total_tokens;
+            state.agent_totals.input_tokens += delta.input_tokens;
+            state.agent_totals.output_tokens += delta.output_tokens;
+            state.agent_totals.total_tokens += delta.total_tokens;
         }
         if let Some(rate_limits) = rate_limits {
-            state.codex_rate_limits = Some(rate_limits);
+            state.rate_limits = Some(rate_limits);
         }
     }
 
@@ -851,7 +861,7 @@ impl OrchestratorRuntime {
             .num_seconds()
             .max(0) as u64;
         let mut state = self.state.lock().await;
-        state.codex_totals.seconds_running += runtime_seconds;
+        state.agent_totals.seconds_running += runtime_seconds;
     }
 
     async fn handle_command(&mut self, command: OrchestratorCommand) -> Result<()> {
@@ -905,18 +915,19 @@ impl OrchestratorRuntime {
                     issue_id: issue_id.clone(),
                     identifier: entry.identifier.clone(),
                     state: entry.issue.state.clone(),
+                    provider_kind: entry.provider_kind,
                     worker_host: entry.worker_host.clone(),
                     workspace_path: entry.workspace_path.clone(),
                     session_id: entry.session_id.clone(),
-                    codex_app_server_pid: entry.codex_app_server_pid.clone(),
-                    codex_input_tokens: entry.codex_input_tokens,
-                    codex_output_tokens: entry.codex_output_tokens,
-                    codex_total_tokens: entry.codex_total_tokens,
+                    provider_process_id: entry.provider_process_id.clone(),
+                    agent_input_tokens: entry.agent_input_tokens,
+                    agent_output_tokens: entry.agent_output_tokens,
+                    agent_total_tokens: entry.agent_total_tokens,
                     turn_count: entry.turn_count,
                     started_at: entry.started_at,
-                    last_codex_timestamp: entry.last_codex_timestamp,
-                    last_codex_message: entry.last_codex_message.clone(),
-                    last_codex_event: entry.last_codex_event.clone(),
+                    last_agent_timestamp: entry.last_agent_timestamp,
+                    last_agent_message: entry.last_agent_message.clone(),
+                    last_agent_event: entry.last_agent_event.clone(),
                     runtime_seconds: now
                         .signed_duration_since(entry.started_at)
                         .num_seconds()
@@ -936,8 +947,8 @@ impl OrchestratorRuntime {
                     workspace_path: entry.workspace_path.clone(),
                 })
                 .collect(),
-            codex_totals: state.codex_totals.clone(),
-            rate_limits: state.codex_rate_limits.clone(),
+            agent_totals: state.agent_totals.clone(),
+            rate_limits: state.rate_limits.clone(),
             polling: PollingSnapshot {
                 checking: state.poll_check_in_progress,
                 next_poll_in_ms: state
@@ -972,23 +983,31 @@ struct TokenDelta {
 
 fn apply_usage_update(entry: &mut RunningEntry, usage: Usage) -> TokenDelta {
     let (input_delta, input_reported) =
-        compute_token_delta(entry.codex_last_reported_input_tokens, usage.input_tokens);
+        compute_token_delta(entry.agent_last_reported_input_tokens, usage.input_tokens);
     let (output_delta, output_reported) =
-        compute_token_delta(entry.codex_last_reported_output_tokens, usage.output_tokens);
+        compute_token_delta(entry.agent_last_reported_output_tokens, usage.output_tokens);
     let (total_delta, total_reported) =
-        compute_token_delta(entry.codex_last_reported_total_tokens, usage.total_tokens);
+        compute_token_delta(entry.agent_last_reported_total_tokens, usage.total_tokens);
 
-    entry.codex_input_tokens += input_delta;
-    entry.codex_output_tokens += output_delta;
-    entry.codex_total_tokens += total_delta;
-    entry.codex_last_reported_input_tokens = input_reported;
-    entry.codex_last_reported_output_tokens = output_reported;
-    entry.codex_last_reported_total_tokens = total_reported;
+    entry.agent_input_tokens += input_delta;
+    entry.agent_output_tokens += output_delta;
+    entry.agent_total_tokens += total_delta;
+    entry.agent_last_reported_input_tokens = input_reported;
+    entry.agent_last_reported_output_tokens = output_reported;
+    entry.agent_last_reported_total_tokens = total_reported;
 
     TokenDelta {
         input_tokens: input_delta,
         output_tokens: output_delta,
         total_tokens: total_delta,
+    }
+}
+
+fn usage_from_agent_usage(usage: crate::provider::AgentUsage) -> Usage {
+    Usage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
     }
 }
 
@@ -1284,19 +1303,20 @@ mod tests {
         RunningEntry {
             identifier: issue.identifier.clone(),
             issue,
+            provider_kind: ProviderKind::Codex,
             started_at: Utc::now(),
             session_id: None,
-            codex_app_server_pid: None,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
+            provider_process_id: None,
+            agent_input_tokens: 0,
+            agent_output_tokens: 0,
+            agent_total_tokens: 0,
+            agent_last_reported_input_tokens: 0,
+            agent_last_reported_output_tokens: 0,
+            agent_last_reported_total_tokens: 0,
             turn_count: 0,
-            last_codex_timestamp: None,
-            last_codex_message: None,
-            last_codex_event: None,
+            last_agent_timestamp: None,
+            last_agent_message: None,
+            last_agent_event: None,
             runtime_seconds: 0,
             workspace_path: None,
             worker_host: worker_host.map(ToString::to_string),
@@ -1467,19 +1487,20 @@ mod tests {
         let mut entry = RunningEntry {
             identifier: "MT-1".to_string(),
             issue: issue(),
+            provider_kind: ProviderKind::Codex,
             started_at: Utc::now(),
             session_id: None,
-            codex_app_server_pid: None,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
+            provider_process_id: None,
+            agent_input_tokens: 0,
+            agent_output_tokens: 0,
+            agent_total_tokens: 0,
+            agent_last_reported_input_tokens: 0,
+            agent_last_reported_output_tokens: 0,
+            agent_last_reported_total_tokens: 0,
             turn_count: 0,
-            last_codex_timestamp: None,
-            last_codex_message: None,
-            last_codex_event: None,
+            last_agent_timestamp: None,
+            last_agent_message: None,
+            last_agent_event: None,
             runtime_seconds: 0,
             workspace_path: None,
             worker_host: None,
@@ -1510,9 +1531,9 @@ mod tests {
         assert_eq!(second.input_tokens, 2);
         assert_eq!(second.output_tokens, 1);
         assert_eq!(second.total_tokens, 3);
-        assert_eq!(entry.codex_input_tokens, 10);
-        assert_eq!(entry.codex_output_tokens, 4);
-        assert_eq!(entry.codex_total_tokens, 14);
+        assert_eq!(entry.agent_input_tokens, 10);
+        assert_eq!(entry.agent_output_tokens, 4);
+        assert_eq!(entry.agent_total_tokens, 14);
     }
 
     #[tokio::test]

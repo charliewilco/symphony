@@ -141,7 +141,7 @@ async fn run_terminal_dashboard(
         let snapshot = orchestrator.snapshot().await;
         let (total_tokens, snapshot): (u64, Option<Snapshot>) = match snapshot {
             Ok(snapshot) => {
-                let total_tokens = snapshot.codex_totals.total_tokens;
+                let total_tokens = snapshot.agent_totals.total_tokens;
                 last_token_snapshot = Some(total_tokens);
                 (total_tokens, Some(snapshot))
             }
@@ -547,7 +547,7 @@ fn init_tracing(logs_root: &Path) -> Result<()> {
 fn acknowledgement_banner() -> String {
     [
         "This Symphony implementation is a low key engineering preview.",
-        "Codex will run without any guardrails.",
+        "Your configured agent provider will run without any guardrails.",
         "Symphony Rust is not a supported product and is presented as-is.",
         "To proceed, start with `--i-understand-that-this-will-be-running-without-the-usual-guardrails` CLI argument",
     ]
@@ -558,7 +558,7 @@ fn acknowledgement_banner() -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rsymphony::config::{CliOverrides, Settings};
+    use rsymphony::config::{CliOverrides, ProviderKind, Settings};
     use rsymphony::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
@@ -587,21 +587,22 @@ mod tests {
                 issue_id: "issue-1".to_string(),
                 identifier: "MT-725".to_string(),
                 state: "In Progress".to_string(),
+                provider_kind: ProviderKind::Codex,
                 worker_host: None,
                 workspace_path: None,
                 session_id: Some("thread-1-turn-1".to_string()),
-                codex_app_server_pid: Some("2510350".to_string()),
-                codex_input_tokens: 100,
-                codex_output_tokens: 25,
-                codex_total_tokens: 125,
+                provider_process_id: Some("2510350".to_string()),
+                agent_input_tokens: 100,
+                agent_output_tokens: 25,
+                agent_total_tokens: 125,
                 turn_count: 3,
                 started_at: Utc::now(),
-                last_codex_timestamp: None,
-                last_codex_message: Some(json!({
+                last_agent_timestamp: None,
+                last_agent_message: Some(json!({
                     "event": "command_output_streaming",
                     "message": { "text": "command output streaming: > mt-721" }
                 })),
-                last_codex_event: Some("command_output_streaming".to_string()),
+                last_agent_event: Some("command_output_streaming".to_string()),
                 runtime_seconds: 90,
             }],
             retrying: vec![RetrySnapshot {
@@ -613,7 +614,7 @@ mod tests {
                 worker_host: None,
                 workspace_path: None,
             }],
-            codex_totals: TokenTotals {
+            agent_totals: TokenTotals {
                 input_tokens: 100,
                 output_tokens: 25,
                 total_tokens: 125,

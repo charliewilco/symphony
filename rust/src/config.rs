@@ -24,7 +24,7 @@ pub struct Settings {
     pub workspace: WorkspaceSettings,
     pub worker: WorkerSettings,
     pub agent: AgentSettings,
-    pub codex: CodexSettings,
+    pub provider: ProviderSettings,
     pub hooks: HookSettings,
     pub observability: ObservabilitySettings,
     pub server: ServerSettings,
@@ -66,15 +66,83 @@ pub struct AgentSettings {
     pub max_concurrent_agents_by_state: HashMap<String, usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Codex,
+    Claude,
+    Gemini,
+    Ollama,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+            Self::Ollama => "ollama",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GeminiOutputFormat {
+    StreamJson,
+    Json,
+}
+
+impl GeminiOutputFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StreamJson => "stream-json",
+            Self::Json => "json",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct CodexSettings {
+pub struct ProviderSettings {
+    pub kind: ProviderKind,
+    pub turn_timeout_ms: u64,
+    pub read_timeout_ms: u64,
+    pub stall_timeout_ms: u64,
+    pub codex: CodexProviderSettings,
+    pub claude: ClaudeProviderSettings,
+    pub gemini: GeminiProviderSettings,
+    pub ollama: OllamaProviderSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexProviderSettings {
     pub command: String,
     pub approval_policy: JsonValue,
     pub thread_sandbox: String,
     pub turn_sandbox_policy: Option<JsonValue>,
-    pub turn_timeout_ms: u64,
-    pub read_timeout_ms: u64,
-    pub stall_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaudeProviderSettings {
+    pub node_command: String,
+    pub entrypoint: Option<PathBuf>,
+    pub allowed_tools: Vec<String>,
+    pub permission_mode: String,
+    pub setting_sources: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeminiProviderSettings {
+    pub command: String,
+    pub output_format: GeminiOutputFormat,
+}
+
+#[derive(Clone, Debug)]
+pub struct OllamaProviderSettings {
+    pub base_url: String,
+    pub model: String,
+    pub stream: bool,
+    pub think: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -203,7 +271,9 @@ struct RawRoot {
     #[serde(default)]
     agent: RawAgent,
     #[serde(default)]
-    codex: RawCodex,
+    provider: RawProvider,
+    #[serde(default)]
+    codex: RawCodexProvider,
     #[serde(default)]
     hooks: RawHooks,
     #[serde(default)]
@@ -249,14 +319,50 @@ struct RawAgent {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct RawCodex {
+struct RawProvider {
+    kind: Option<String>,
+    turn_timeout_ms: Option<FlexibleU64>,
+    read_timeout_ms: Option<FlexibleU64>,
+    stall_timeout_ms: Option<FlexibleU64>,
+    #[serde(default)]
+    codex: RawCodexProvider,
+    #[serde(default)]
+    claude: RawClaudeProvider,
+    #[serde(default)]
+    gemini: RawGeminiProvider,
+    #[serde(default)]
+    ollama: RawOllamaProvider,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawCodexProvider {
     command: Option<String>,
     approval_policy: Option<JsonValue>,
     thread_sandbox: Option<String>,
     turn_sandbox_policy: Option<JsonValue>,
-    turn_timeout_ms: Option<FlexibleU64>,
-    read_timeout_ms: Option<FlexibleU64>,
-    stall_timeout_ms: Option<FlexibleU64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawClaudeProvider {
+    node_command: Option<String>,
+    entrypoint: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    permission_mode: Option<String>,
+    setting_sources: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawGeminiProvider {
+    command: Option<String>,
+    output_format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawOllamaProvider {
+    base_url: Option<String>,
+    model: Option<String>,
+    stream: Option<bool>,
+    think: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -394,8 +500,32 @@ impl Settings {
         let tracker_kind = raw.tracker.kind.clone();
         let tracker_api_key = resolve_env_string(raw.tracker.api_key, Some("LINEAR_API_KEY"));
         let tracker_assignee = resolve_env_string(raw.tracker.assignee, Some("LINEAR_ASSIGNEE"));
-
         let mut parse_diagnostics = Vec::new();
+        let provider_kind = parse_provider_kind(
+            raw.provider.kind.as_deref(),
+            raw_legacy_codex_present(&raw.codex),
+            config_path,
+            &mut parse_diagnostics,
+        );
+        let claude_entrypoint = match raw.provider.claude.entrypoint.as_deref() {
+            Some(value) => match expand_path_like(value) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    parse_diagnostics.push(ConfigDiagnostic {
+                        code: "invalid_provider_entrypoint".to_string(),
+                        message: error.to_string(),
+                        file: config_path.display().to_string(),
+                        field_path: Some("provider.claude.entrypoint".to_string()),
+                        line: None,
+                        column: None,
+                        hint: None,
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        let effective_codex = merge_codex_provider_settings(&raw.provider.codex, &raw.codex);
         let agent_state_limits = raw
             .agent
             .max_concurrent_agents_by_state
@@ -498,41 +628,86 @@ impl Settings {
                 ),
                 max_concurrent_agents_by_state: agent_state_limits,
             },
-            codex: CodexSettings {
-                command: raw
-                    .codex
-                    .command
-                    .unwrap_or_else(|| "codex app-server".to_string()),
-                approval_policy: raw
-                    .codex
-                    .approval_policy
-                    .unwrap_or_else(default_approval_policy),
-                thread_sandbox: raw
-                    .codex
-                    .thread_sandbox
-                    .unwrap_or_else(|| "workspace-write".to_string()),
-                turn_sandbox_policy: raw.codex.turn_sandbox_policy,
+            provider: ProviderSettings {
+                kind: provider_kind,
                 turn_timeout_ms: parse_u64_or_default(
-                    raw.codex.turn_timeout_ms.as_ref(),
+                    raw.provider.turn_timeout_ms.as_ref(),
                     3_600_000,
-                    "codex.turn_timeout_ms",
+                    "provider.turn_timeout_ms",
                     config_path,
                     &mut parse_diagnostics,
                 ),
                 read_timeout_ms: parse_u64_or_default(
-                    raw.codex.read_timeout_ms.as_ref(),
+                    raw.provider.read_timeout_ms.as_ref(),
                     5_000,
-                    "codex.read_timeout_ms",
+                    "provider.read_timeout_ms",
                     config_path,
                     &mut parse_diagnostics,
                 ),
                 stall_timeout_ms: parse_u64_or_default(
-                    raw.codex.stall_timeout_ms.as_ref(),
+                    raw.provider.stall_timeout_ms.as_ref(),
                     300_000,
-                    "codex.stall_timeout_ms",
+                    "provider.stall_timeout_ms",
                     config_path,
                     &mut parse_diagnostics,
                 ),
+                codex: CodexProviderSettings {
+                    command: effective_codex
+                        .command
+                        .unwrap_or_else(|| "codex app-server".to_string()),
+                    approval_policy: effective_codex
+                        .approval_policy
+                        .unwrap_or_else(default_approval_policy),
+                    thread_sandbox: effective_codex
+                        .thread_sandbox
+                        .unwrap_or_else(|| "workspace-write".to_string()),
+                    turn_sandbox_policy: effective_codex.turn_sandbox_policy,
+                },
+                claude: ClaudeProviderSettings {
+                    node_command: raw
+                        .provider
+                        .claude
+                        .node_command
+                        .unwrap_or_else(|| "node".to_string()),
+                    entrypoint: claude_entrypoint,
+                    allowed_tools: raw.provider.claude.allowed_tools.unwrap_or_default(),
+                    permission_mode: raw
+                        .provider
+                        .claude
+                        .permission_mode
+                        .unwrap_or_else(|| "default".to_string()),
+                    setting_sources: raw
+                        .provider
+                        .claude
+                        .setting_sources
+                        .unwrap_or_else(|| vec!["project".to_string()]),
+                },
+                gemini: GeminiProviderSettings {
+                    command: raw
+                        .provider
+                        .gemini
+                        .command
+                        .unwrap_or_else(|| "gemini".to_string()),
+                    output_format: parse_gemini_output_format(
+                        raw.provider.gemini.output_format.as_deref(),
+                        config_path,
+                        &mut parse_diagnostics,
+                    ),
+                },
+                ollama: OllamaProviderSettings {
+                    base_url: raw
+                        .provider
+                        .ollama
+                        .base_url
+                        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
+                    model: raw
+                        .provider
+                        .ollama
+                        .model
+                        .unwrap_or_else(|| "qwen2.5-coder:latest".to_string()),
+                    stream: raw.provider.ollama.stream.unwrap_or(false),
+                    think: raw.provider.ollama.think.unwrap_or(false),
+                },
             },
             hooks: HookSettings {
                 after_create: raw.hooks.after_create,
@@ -650,8 +825,8 @@ impl Settings {
                 self.agent.max_concurrent_agents as u64,
             ),
             ("agent.max_turns", self.agent.max_turns as u64),
-            ("codex.turn_timeout_ms", self.codex.turn_timeout_ms),
-            ("codex.read_timeout_ms", self.codex.read_timeout_ms),
+            ("provider.turn_timeout_ms", self.provider.turn_timeout_ms),
+            ("provider.read_timeout_ms", self.provider.read_timeout_ms),
         ] {
             if value == 0 {
                 diagnostics.push(ConfigDiagnostic {
@@ -666,15 +841,60 @@ impl Settings {
             }
         }
 
-        if self.codex.command.trim().is_empty() {
+        if matches!(self.provider.kind, ProviderKind::Codex)
+            && self.provider.codex.command.trim().is_empty()
+        {
             diagnostics.push(ConfigDiagnostic {
                 code: "empty_codex_command".to_string(),
-                message: "`codex.command` must be present and non-empty.".to_string(),
+                message: "`provider.codex.command` must be present and non-empty.".to_string(),
                 file,
-                field_path: Some("codex.command".to_string()),
+                field_path: Some("provider.codex.command".to_string()),
                 line: None,
                 column: None,
                 hint: Some("Set it to something like `codex app-server`.".to_string()),
+            });
+        }
+
+        if matches!(self.provider.kind, ProviderKind::Claude)
+            && self.provider.claude.node_command.trim().is_empty()
+        {
+            diagnostics.push(ConfigDiagnostic {
+                code: "empty_provider_command".to_string(),
+                message: "`provider.claude.node_command` must be present and non-empty."
+                    .to_string(),
+                file: config_path.display().to_string(),
+                field_path: Some("provider.claude.node_command".to_string()),
+                line: None,
+                column: None,
+                hint: Some("Set it to a Node runtime such as `node`.".to_string()),
+            });
+        }
+
+        if matches!(self.provider.kind, ProviderKind::Gemini)
+            && self.provider.gemini.command.trim().is_empty()
+        {
+            diagnostics.push(ConfigDiagnostic {
+                code: "empty_provider_command".to_string(),
+                message: "`provider.gemini.command` must be present and non-empty.".to_string(),
+                file: config_path.display().to_string(),
+                field_path: Some("provider.gemini.command".to_string()),
+                line: None,
+                column: None,
+                hint: Some("Set it to a Gemini CLI command.".to_string()),
+            });
+        }
+
+        if matches!(self.provider.kind, ProviderKind::Ollama)
+            && self.provider.ollama.model.trim().is_empty()
+        {
+            diagnostics.push(ConfigDiagnostic {
+                code: "missing_provider_model".to_string(),
+                message: "`provider.ollama.model` must be present and non-empty.".to_string(),
+                file: config_path.display().to_string(),
+                field_path: Some("provider.ollama.model".to_string()),
+                line: None,
+                column: None,
+                hint: Some("Set it to an installed Ollama model name.".to_string()),
             });
         }
 
@@ -697,7 +917,7 @@ impl Settings {
     }
 
     pub fn default_turn_sandbox_policy(&self, workspace: Option<&Path>) -> JsonValue {
-        if let Some(policy) = &self.codex.turn_sandbox_policy {
+        if let Some(policy) = &self.provider.codex.turn_sandbox_policy {
             return policy.clone();
         }
 
@@ -750,8 +970,21 @@ fn load_toml_config(
         )
     })?;
 
+    let legacy_codex_present = raw_legacy_codex_present(&raw.codex);
+    let provider_kind = raw.provider.kind.clone();
     let settings = Settings::from_raw_root(raw, config_path, ConfigFormat::Toml, overrides)?;
     let mut warnings = Vec::new();
+    if legacy_codex_present {
+        warnings.push(
+            "Legacy `[codex]` config is deprecated; move settings under `[provider]`.".to_string(),
+        );
+        if provider_kind.is_some() {
+            warnings.push(
+                "Both `[provider]` and legacy `[codex]` config are present; `[provider]` takes precedence."
+                    .to_string(),
+            );
+        }
+    }
     if workflow_path.is_some_and(|path| path.exists())
         && workflow::has_front_matter(workflow_path.expect("checked above")).unwrap_or(false)
     {
@@ -1010,6 +1243,86 @@ fn parse_usize_or_default(
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> usize {
     parse_usize_opt(value, field_path, config_path, diagnostics).unwrap_or(default)
+}
+
+fn parse_provider_kind(
+    raw: Option<&str>,
+    legacy_codex_present: bool,
+    config_path: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> ProviderKind {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("codex") => ProviderKind::Codex,
+        Some("claude") => ProviderKind::Claude,
+        Some("gemini") => ProviderKind::Gemini,
+        Some("ollama") => ProviderKind::Ollama,
+        Some(other) => {
+            diagnostics.push(ConfigDiagnostic {
+                code: "unsupported_provider_kind".to_string(),
+                message: format!("Unsupported provider kind `{other}`."),
+                file: config_path.display().to_string(),
+                field_path: Some("provider.kind".to_string()),
+                line: None,
+                column: None,
+                hint: Some("Use `codex`, `claude`, `gemini`, or `ollama`.".to_string()),
+            });
+            ProviderKind::Codex
+        }
+        None if legacy_codex_present => ProviderKind::Codex,
+        None => ProviderKind::Codex,
+    }
+}
+
+fn parse_gemini_output_format(
+    raw: Option<&str>,
+    config_path: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> GeminiOutputFormat {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("stream-json") => GeminiOutputFormat::StreamJson,
+        Some("json") => GeminiOutputFormat::Json,
+        Some(other) => {
+            diagnostics.push(ConfigDiagnostic {
+                code: "unsupported_gemini_output_format".to_string(),
+                message: format!("Unsupported Gemini output format `{other}`."),
+                file: config_path.display().to_string(),
+                field_path: Some("provider.gemini.output_format".to_string()),
+                line: None,
+                column: None,
+                hint: Some("Use `stream-json` or `json`.".to_string()),
+            });
+            GeminiOutputFormat::StreamJson
+        }
+        None => GeminiOutputFormat::StreamJson,
+    }
+}
+
+fn raw_legacy_codex_present(raw: &RawCodexProvider) -> bool {
+    raw.command.is_some()
+        || raw.approval_policy.is_some()
+        || raw.thread_sandbox.is_some()
+        || raw.turn_sandbox_policy.is_some()
+}
+
+fn merge_codex_provider_settings(
+    provider: &RawCodexProvider,
+    legacy: &RawCodexProvider,
+) -> RawCodexProvider {
+    RawCodexProvider {
+        command: provider.command.clone().or_else(|| legacy.command.clone()),
+        approval_policy: provider
+            .approval_policy
+            .clone()
+            .or_else(|| legacy.approval_policy.clone()),
+        thread_sandbox: provider
+            .thread_sandbox
+            .clone()
+            .or_else(|| legacy.thread_sandbox.clone()),
+        turn_sandbox_policy: provider
+            .turn_sandbox_policy
+            .clone()
+            .or_else(|| legacy.turn_sandbox_policy.clone()),
+    }
 }
 
 fn default_approval_policy() -> JsonValue {

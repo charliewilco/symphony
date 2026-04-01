@@ -13,11 +13,15 @@ const RUNNING_EVENT_DEFAULT_WIDTH: usize = 44;
 const RUNNING_EVENT_MIN_WIDTH: usize = 12;
 const RUNNING_ROW_CHROME_WIDTH: usize = 10;
 
-pub fn humanize_codex_message(message: Option<&JsonValue>) -> String {
+pub fn humanize_agent_message(message: Option<&JsonValue>) -> String {
     match message {
-        None => "no codex message yet".to_string(),
+        None => "no agent message yet".to_string(),
         Some(message) => truncate(&humanize_message_inner(message), 140),
     }
+}
+
+pub fn humanize_codex_message(message: Option<&JsonValue>) -> String {
+    humanize_agent_message(message)
 }
 
 pub fn format_snapshot_content_for_test(
@@ -59,16 +63,16 @@ pub fn format_snapshot_content(
                 &format!("Throughput: {} tps", format_tps(tps)),
                 &format!(
                     "Runtime: {}",
-                    format_runtime_seconds(snapshot.codex_totals.seconds_running)
+                    format_runtime_seconds(snapshot.agent_totals.seconds_running)
                 ),
                 width,
             ));
             lines.push(format_three_columns(
                 &format!(
                     "Tokens: in {} | out {} | total {}",
-                    format_count(snapshot.codex_totals.input_tokens),
-                    format_count(snapshot.codex_totals.output_tokens),
-                    format_count(snapshot.codex_totals.total_tokens)
+                    format_count(snapshot.agent_totals.input_tokens),
+                    format_count(snapshot.agent_totals.output_tokens),
+                    format_count(snapshot.agent_totals.total_tokens)
                 ),
                 &format!(
                     "Rate Limits: {}",
@@ -170,24 +174,24 @@ pub fn render_snapshot_html(
                 term("term-strong", "│ Runtime: "),
                 term(
                     "term-magenta",
-                    &format_runtime_seconds(snapshot.codex_totals.seconds_running),
+                    &format_runtime_seconds(snapshot.agent_totals.seconds_running),
                 ),
             ]));
             lines.push(term_line([
                 term("term-strong", "│ Tokens: "),
                 term(
                     "term-yellow",
-                    &format!("in {}", format_count(snapshot.codex_totals.input_tokens)),
+                    &format!("in {}", format_count(snapshot.agent_totals.input_tokens)),
                 ),
                 term("term-muted", " | "),
                 term(
                     "term-yellow",
-                    &format!("out {}", format_count(snapshot.codex_totals.output_tokens)),
+                    &format!("out {}", format_count(snapshot.agent_totals.output_tokens)),
                 ),
                 term("term-muted", " | "),
                 term(
                     "term-yellow",
-                    &format!("total {}", format_count(snapshot.codex_totals.total_tokens)),
+                    &format!("total {}", format_count(snapshot.agent_totals.total_tokens)),
                 ),
             ]));
             lines.push(term_line([
@@ -810,7 +814,7 @@ fn format_running_summary(
     let issue = format_cell(&entry.identifier, RUNNING_ID_WIDTH, Alignment::Left);
     let state = format_cell(&entry.state, RUNNING_STAGE_WIDTH, Alignment::Left);
     let pid = format_cell(
-        entry.codex_app_server_pid.as_deref().unwrap_or("n/a"),
+        entry.provider_process_id.as_deref().unwrap_or("n/a"),
         RUNNING_PID_WIDTH,
         Alignment::Left,
     );
@@ -820,7 +824,7 @@ fn format_running_summary(
         Alignment::Left,
     );
     let tokens = format_cell(
-        &format_count(entry.codex_total_tokens),
+        &format_count(entry.agent_total_tokens),
         RUNNING_TOKENS_WIDTH,
         Alignment::Right,
     );
@@ -830,7 +834,7 @@ fn format_running_summary(
         Alignment::Left,
     );
     let event = format_cell(
-        &summarize_message(entry.last_codex_message.as_ref()),
+        &summarize_message(entry.last_agent_message.as_ref()),
         running_event_width,
         Alignment::Left,
     );
@@ -844,7 +848,7 @@ fn render_running_summary_html(
     let issue = format_cell(&entry.identifier, RUNNING_ID_WIDTH, Alignment::Left);
     let state = format_cell(&entry.state, RUNNING_STAGE_WIDTH, Alignment::Left);
     let pid = format_cell(
-        entry.codex_app_server_pid.as_deref().unwrap_or("n/a"),
+        entry.provider_process_id.as_deref().unwrap_or("n/a"),
         RUNNING_PID_WIDTH,
         Alignment::Left,
     );
@@ -854,7 +858,7 @@ fn render_running_summary_html(
         Alignment::Left,
     );
     let tokens = format_cell(
-        &format_count(entry.codex_total_tokens),
+        &format_count(entry.agent_total_tokens),
         RUNNING_TOKENS_WIDTH,
         Alignment::Right,
     );
@@ -864,11 +868,11 @@ fn render_running_summary_html(
         Alignment::Left,
     );
     let event = format_cell(
-        &summarize_message(entry.last_codex_message.as_ref()),
+        &summarize_message(entry.last_agent_message.as_ref()),
         running_event_width,
         Alignment::Left,
     );
-    let status_class = running_status_class(entry.last_codex_event.as_deref());
+    let status_class = running_status_class(entry.last_agent_event.as_deref());
 
     term_line([
         raw("│ "),
@@ -963,7 +967,7 @@ fn compact_session_id(session_id: Option<&str>) -> String {
 }
 
 fn summarize_message(message: Option<&JsonValue>) -> String {
-    humanize_codex_message(message)
+    humanize_agent_message(message)
 }
 
 fn running_event_width(terminal_columns: Option<usize>) -> usize {
@@ -1046,7 +1050,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Settings, settings_from_toml_str};
+    use crate::config::{ProviderKind, Settings, settings_from_toml_str};
     use crate::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
@@ -1065,22 +1069,23 @@ mod tests {
                 issue_id: "issue-1".to_string(),
                 identifier: "MT-101".to_string(),
                 state: "In Progress".to_string(),
+                provider_kind: ProviderKind::Codex,
                 worker_host: None,
                 workspace_path: None,
                 session_id: Some("thread-1-turn-1".to_string()),
-                codex_app_server_pid: Some("4242".to_string()),
-                codex_input_tokens: 100,
-                codex_output_tokens: 25,
-                codex_total_tokens: 125,
+                provider_process_id: Some("4242".to_string()),
+                agent_input_tokens: 100,
+                agent_output_tokens: 25,
+                agent_total_tokens: 125,
                 turn_count: 3,
                 started_at: Utc::now(),
-                last_codex_timestamp: None,
-                last_codex_message: Some(json!({
+                last_agent_timestamp: None,
+                last_agent_message: Some(json!({
                     "event": "approval_auto_approved",
                     "message": { "method": "item/commandExecution/requestApproval" },
                     "decision": "acceptForSession"
                 })),
-                last_codex_event: Some("approval_auto_approved".to_string()),
+                last_agent_event: Some("approval_auto_approved".to_string()),
                 runtime_seconds: 90,
             }],
             retrying: vec![RetrySnapshot {
@@ -1092,7 +1097,7 @@ mod tests {
                 worker_host: None,
                 workspace_path: None,
             }],
-            codex_totals: TokenTotals {
+            agent_totals: TokenTotals {
                 input_tokens: 100,
                 output_tokens: 25,
                 total_tokens: 125,
@@ -1113,7 +1118,7 @@ mod tests {
 
     #[test]
     fn humanizes_key_codex_messages() {
-        assert_eq!(humanize_codex_message(None), "no codex message yet");
+        assert_eq!(humanize_codex_message(None), "no agent message yet");
         assert_eq!(
             humanize_codex_message(Some(&json!({
                 "event": "session_started",

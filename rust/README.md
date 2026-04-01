@@ -13,9 +13,9 @@ This directory contains the current Rust implementation of Symphony, based on
 
 1. Polls Linear for candidate work
 2. Creates a workspace per issue
-3. Launches Codex in App Server mode inside the workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Launches the configured agent provider inside the workspace
+4. Sends a workflow prompt to that provider
+5. Keeps the provider working on the issue until the work is done
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql`
 tool so that repo skills can make raw Linear GraphQL calls.
@@ -163,7 +163,7 @@ Optional flags:
 - `validate` checks config and prints clear errors; add `--json` for machine-readable output
 
 `.symphony.toml` contains machine-validated runtime config. `WORKFLOW.md` is the
-Codex session prompt only.
+provider-agnostic session prompt only.
 
 Minimal example:
 
@@ -185,7 +185,10 @@ git clone git@github.com:your-org/your-repo.git .
 max_concurrent_agents = 10
 max_turns = 20
 
-[codex]
+[provider]
+kind = "codex"
+
+[provider.codex]
 command = "codex app-server"
 ```
 
@@ -206,8 +209,12 @@ Notes:
   different worker are treated as unroutable.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR`
-  before path handling, while `codex.command` stays a shell command string and
-  any `$VAR` expansion there happens in the launched shell.
+  before path handling, while provider command fields stay shell command strings
+  and any `$VAR` expansion there happens in the launched shell.
+- `provider.kind` selects the active runtime adapter. Supported values are
+  `codex`, `claude`, `gemini`, and `ollama`.
+- Legacy `[codex]` config is still accepted for one release and is treated as
+  `[provider] kind = "codex"` plus `[provider.codex]`.
 - If `.symphony.toml` is missing, Symphony falls back to legacy `WORKFLOW.md`
   front matter for one release and prints a deprecation warning.
 - If startup config is invalid, Symphony does not boot and prints all detected
@@ -229,7 +236,7 @@ Notes:
 - `justfile`: local development and install commands
 - `.symphony.toml`: in-repo runtime configuration
 - `WORKFLOW.md`: prompt contract used by local runs
-- `../.codex/`: repository-local Codex skills and setup helpers
+- `../.codex/`: repository-local Codex skills and setup helpers when Codex is the selected provider
 
 ## Testing
 
@@ -250,7 +257,7 @@ resource accounting while still producing a single deployable binary.
 
 ### What's the easiest way to set this up for my own codebase?
 
-Launch `codex` in your repo, give it the URL to the Symphony repo, and ask it
+Launch your preferred coding agent in your repo, give it the URL to the Symphony repo, and ask it
 to adapt the workflow and hooks for your environment.
 
 ## License
