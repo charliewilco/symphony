@@ -40,4 +40,4 @@ Commit messages in this repo use short conventional prefixes such as `feat(rust)
 
 ## Agent Notes
 
-Do not overwrite changes you did not make. If a task touches both implementations, treat `elixir/` as the behavioral reference and `rust/` as the target implementation.
+Do not overwrite changes you did not make. If a task touches both implementations, treat `elixir/` as the behavioral reference and `rust/` as the target implementation. Do not change or modify `elixir/` or `SPEC.md`
