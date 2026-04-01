@@ -10,16 +10,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::config::{CliOverrides, RefreshPayload, Settings};
+use crate::config::{CliOverrides, RefreshPayload};
+use crate::config_store::ConfigStore;
 use crate::orchestrator::{OrchestratorHandle, Snapshot};
 use crate::presenter::{self, SnapshotError};
-use crate::workflow_store::WorkflowStore;
 
 #[derive(Clone)]
 pub struct HttpState {
     backend: Arc<dyn ObservabilityBackend>,
-    workflow_store: WorkflowStore,
-    overrides: CliOverrides,
+    config_store: ConfigStore,
     snapshot_timeout_ms: u64,
 }
 
@@ -47,17 +46,17 @@ impl ObservabilityBackend for OrchestratorBackend {
 
 pub async fn serve(
     orchestrator: OrchestratorHandle,
-    workflow_store: WorkflowStore,
-    overrides: CliOverrides,
+    config_store: ConfigStore,
+    _workflow_store: crate::workflow_store::WorkflowStore,
+    _overrides: CliOverrides,
 ) -> Result<()> {
-    let settings = Settings::from_workflow(&workflow_store.current().await, &overrides)?;
+    let settings = config_store.current_settings().await;
     let Some(port) = settings.server.port else {
         return Ok(());
     };
     let state = HttpState {
         backend: Arc::new(OrchestratorBackend { orchestrator }),
-        workflow_store,
-        overrides,
+        config_store,
         snapshot_timeout_ms: 15_000,
     };
     let app = router(state);
@@ -93,16 +92,13 @@ pub fn router(state: HttpState) -> Router {
 }
 
 async fn dashboard(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let settings = Settings::from_workflow(&state.workflow_store.current().await, &state.overrides)
-        .map_err(|_| SnapshotError::Unavailable);
-    match (snapshot_with_timeout(&state).await, settings) {
-        (Ok(snapshot), Ok(settings)) => {
-            Html(presenter::render_dashboard_html(&snapshot, &settings))
-        }
-        (Err(SnapshotError::Timeout), _) => {
+    let settings = state.config_store.current_settings().await;
+    match snapshot_with_timeout(&state).await {
+        Ok(snapshot) => Html(presenter::render_dashboard_html(&snapshot, &settings)),
+        Err(SnapshotError::Timeout) => {
             Html("<html><body><h1>Symphony</h1><p>snapshot_timeout</p></body></html>".to_string())
         }
-        _ => Html(
+        Err(_) => Html(
             "<html><body><h1>Symphony</h1><p>snapshot_unavailable</p></body></html>".to_string(),
         ),
     }
@@ -617,8 +613,7 @@ async fn issue_route(
     Path(issue_identifier): Path<String>,
     State(state): State<Arc<HttpState>>,
 ) -> Response {
-    let settings =
-        Settings::from_workflow(&state.workflow_store.current().await, &state.overrides).ok();
+    let settings = Some(state.config_store.current_settings().await);
 
     match snapshot_with_timeout(&state).await {
         Ok(snapshot) => {
@@ -684,6 +679,8 @@ mod tests {
     use tokio::time::sleep;
     use tower::util::ServiceExt;
 
+    use crate::config::CliOverrides;
+    use crate::config_store::ConfigStore;
     use crate::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
@@ -720,16 +717,19 @@ mod tests {
         ));
         std::fs::create_dir_all(&workflow_dir).unwrap();
         let workflow_path = workflow_dir.join("WORKFLOW.md");
+        let config_path = workflow_dir.join(".symphony.toml");
+        std::fs::write(&workflow_path, "Prompt body\n").unwrap();
         std::fs::write(
-            &workflow_path,
-            "---\ntracker:\n  kind: memory\nworkspace:\n  root: /tmp/symphony-http\n---\n",
+            &config_path,
+            "[tracker]\nkind = \"memory\"\n[workspace]\nroot = \"/tmp/symphony-http\"\n",
         )
         .unwrap();
-        let workflow_store = WorkflowStore::new(workflow_path).await.unwrap();
+        let config_store = ConfigStore::new(config_path, workflow_path, CliOverrides::default())
+            .await
+            .unwrap();
         HttpState {
             backend,
-            workflow_store,
-            overrides: CliOverrides::default(),
+            config_store,
             snapshot_timeout_ms: 5,
         }
     }

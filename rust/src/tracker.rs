@@ -760,19 +760,10 @@ fn normalize_assignee_match_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
-    use crate::workflow::LoadedWorkflow;
+    use crate::config::{Settings, settings_from_toml_str};
 
     fn settings() -> Settings {
-        Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str("tracker:\n  kind: memory\n").unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap()
+        settings_from_toml_str("[tracker]\nkind = \"memory\"\n")
     }
 
     fn issue() -> Issue {

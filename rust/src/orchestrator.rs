@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use crate::agent_runner::{self, WorkerEvent};
 use crate::codex::CodexUpdate;
 use crate::config::{CliOverrides, RefreshPayload, Settings, normalize_issue_state};
+use crate::config_store::ConfigStore;
 use crate::tracker::{Issue, Tracker, tracker_for_settings};
 use crate::workflow_store::WorkflowStore;
 use crate::workspace;
@@ -26,8 +27,8 @@ pub struct OrchestratorHandle {
 pub struct OrchestratorRuntime {
     state: Arc<Mutex<OrchestratorState>>,
     command_tx: mpsc::Sender<OrchestratorCommand>,
+    config_store: ConfigStore,
     workflow_store: WorkflowStore,
-    overrides: CliOverrides,
     worker_events_tx: mpsc::Sender<WorkerEvent>,
     worker_events_rx: mpsc::Receiver<WorkerEvent>,
     command_rx: mpsc::Receiver<OrchestratorCommand>,
@@ -196,11 +197,11 @@ impl OrchestratorHandle {
 
 impl OrchestratorRuntime {
     pub async fn start(
+        config_store: ConfigStore,
         workflow_store: WorkflowStore,
-        overrides: CliOverrides,
+        _overrides: CliOverrides,
     ) -> Result<OrchestratorHandle> {
-        let current_settings =
-            Settings::from_workflow(&workflow_store.current().await, &overrides)?;
+        let current_settings = config_store.current_settings().await;
         let state = Arc::new(Mutex::new(OrchestratorState {
             poll_interval_ms: current_settings.polling.interval_ms,
             max_concurrent_agents: current_settings.agent.max_concurrent_agents,
@@ -215,8 +216,8 @@ impl OrchestratorRuntime {
         let mut runtime = Self {
             state,
             command_tx: command_tx.clone(),
+            config_store,
             workflow_store,
-            overrides,
             worker_events_tx,
             worker_events_rx,
             command_rx,
@@ -257,11 +258,13 @@ impl OrchestratorRuntime {
     }
 
     async fn refresh_settings(&self) -> Result<Settings> {
-        if let Err(error) = self.workflow_store.maybe_reload().await {
-            tracing::error!("Failed to reload workflow: {error}");
+        if let Err(error) = self.config_store.maybe_reload().await {
+            tracing::error!("Failed to reload config: {error}");
         }
-        let settings =
-            Settings::from_workflow(&self.workflow_store.current().await, &self.overrides)?;
+        if let Err(error) = self.workflow_store.maybe_reload().await {
+            tracing::error!("Failed to reload workflow prompt: {error}");
+        }
+        let settings = self.config_store.current_settings().await;
         let mut state = self.state.lock().await;
         state.poll_interval_ms = settings.polling.interval_ms;
         state.max_concurrent_agents = settings.agent.max_concurrent_agents;
@@ -270,11 +273,7 @@ impl OrchestratorRuntime {
     }
 
     async fn run_terminal_cleanup(&self) {
-        let Ok(settings) =
-            Settings::from_workflow(&self.workflow_store.current().await, &self.overrides)
-        else {
-            return;
-        };
+        let settings = self.config_store.current_settings().await;
         let tracker = tracker_for_settings(&settings);
         let Ok(issues) = tracker
             .fetch_issues_by_states(&settings.tracker.terminal_states, &settings)
@@ -1306,11 +1305,17 @@ mod tests {
         }
     }
 
-    async fn test_runtime_with_workflow(workflow_yaml: &str) -> OrchestratorRuntime {
+    async fn test_runtime_with_workflow(config_toml: &str) -> OrchestratorRuntime {
         let dir = tempdir().unwrap();
         let workflow_root = dir.keep();
         let workflow_path = workflow_root.join("WORKFLOW.md");
-        fs::write(&workflow_path, workflow_yaml).unwrap();
+        let config_path = workflow_root.join(".symphony.toml");
+        fs::write(&workflow_path, "Prompt body\n").unwrap();
+        fs::write(&config_path, config_toml).unwrap();
+        let config_store =
+            ConfigStore::new(config_path, workflow_path.clone(), CliOverrides::default())
+                .await
+                .unwrap();
         let workflow_store = WorkflowStore::new(workflow_path).await.unwrap();
         let (command_tx, command_rx) = mpsc::channel(4);
         let (worker_events_tx, worker_events_rx) = mpsc::channel(4);
@@ -1324,8 +1329,8 @@ mod tests {
                 ..OrchestratorState::default()
             })),
             command_tx,
+            config_store,
             workflow_store,
-            overrides: CliOverrides::default(),
             worker_events_tx,
             worker_events_rx,
             command_rx,
@@ -1570,18 +1575,22 @@ mod tests {
 
     #[test]
     fn retry_candidate_issue_requires_routable_and_unblocked_active_issue() {
-        let settings = Settings::from_workflow(
-            &crate::workflow::LoadedWorkflow {
-                config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n",
-                )
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &crate::config::CliOverrides::default(),
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join(".symphony.toml");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &config_path,
+            "[tracker]\nkind = \"memory\"\nactive_states = [\"Todo\", \"In Progress\"]\nterminal_states = [\"Done\"]\n",
         )
         .unwrap();
+        fs::write(&workflow_path, "Prompt body\n").unwrap();
+        let settings = Settings::load(
+            &config_path,
+            Some(&workflow_path),
+            &crate::config::CliOverrides::default(),
+        )
+        .unwrap()
+        .settings;
 
         let mut blocked = issue();
         blocked.state = "Todo".to_string();
@@ -1603,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_tick_survives_workflow_reload_failure() {
-        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+        let mut runtime = test_runtime_with_workflow("[tracker]\nkind = \"memory\"\n").await;
 
         let workflow_path = runtime.workflow_store.path().await;
         fs::remove_file(workflow_path).unwrap();
@@ -1616,7 +1625,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_running_issue_state_updates_the_stored_issue() {
-        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+        let mut runtime = test_runtime_with_workflow("[tracker]\nkind = \"memory\"\n").await;
         let mut running_issue = issue();
         running_issue.state = "In Progress".to_string();
         {
@@ -1643,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_refresh_reports_coalesced_when_poll_is_already_due() {
-        let mut runtime = test_runtime_with_workflow("tracker:\n  kind: memory\n").await;
+        let mut runtime = test_runtime_with_workflow("[tracker]\nkind = \"memory\"\n").await;
         {
             let mut state = runtime.state.lock().await;
             state.poll_check_in_progress = false;

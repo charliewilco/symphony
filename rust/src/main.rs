@@ -2,12 +2,13 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
-use rsymphony::config::{CliOverrides, Settings};
+use clap::{Args as ClapArgs, Parser, Subcommand};
+use rsymphony::config::{CliOverrides, Settings, ValidateOutput, config_file_path, validate};
+use rsymphony::config_store::ConfigStore;
 use rsymphony::http;
 use rsymphony::log_file;
 use rsymphony::orchestrator::{OrchestratorHandle, OrchestratorRuntime, Snapshot};
-use rsymphony::workflow::{load, workflow_file_path};
+use rsymphony::workflow::workflow_file_path;
 use rsymphony::workflow_store::WorkflowStore;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -16,6 +17,8 @@ use tracing_subscriber::prelude::*;
 #[command(name = "rsymphony")]
 #[command(about = "Symphony in Rust")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(
         long = "i-understand-that-this-will-be-running-without-the-usual-guardrails",
         visible_alias = "yolo"
@@ -25,6 +28,20 @@ struct Args {
     logs_root: Option<PathBuf>,
     #[arg(long)]
     port: Option<u16>,
+    #[arg(long = "config")]
+    config_path: Option<PathBuf>,
+    workflow_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Validate(ValidateArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+struct ValidateArgs {
+    #[arg(long)]
+    json: bool,
     workflow_path: Option<PathBuf>,
 }
 
@@ -38,43 +55,53 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    if let Some(command) = args.command {
+        return match command {
+            Command::Validate(validate) => run_validate(validate, args.config_path),
+        };
+    }
+
     if !args.acknowledge_guardrails {
         return Err(anyhow!(acknowledgement_banner()));
     }
 
     let workflow_path = workflow_file_path(args.workflow_path.as_deref())?;
-    if !workflow_path.exists() {
-        return Err(anyhow!(
-            "Workflow file not found: {}",
-            workflow_path.display()
-        ));
-    }
+    let config_path = config_file_path(args.config_path.as_deref())?;
 
     let overrides = CliOverrides {
         logs_root: args.logs_root,
         server_port_override: args.port,
     };
-    let workflow = load(&workflow_path)?;
-    let settings = Settings::from_workflow(&workflow, &overrides)?;
+    let resolved = Settings::load(&config_path, Some(&workflow_path), &overrides)?;
+    let settings = resolved.settings.clone();
     init_tracing(&settings.effective_logs_root(&overrides))?;
+    for warning in &resolved.warnings {
+        tracing::warn!("{warning}");
+    }
 
     let workflow_store = WorkflowStore::new(workflow_path).await?;
+    let config_store =
+        ConfigStore::new(config_path, workflow_store.path().await, overrides.clone()).await?;
+    config_store.spawn_reload_task();
     workflow_store.spawn_reload_task();
-    let orchestrator =
-        OrchestratorRuntime::start(workflow_store.clone(), overrides.clone()).await?;
+    let orchestrator = OrchestratorRuntime::start(
+        config_store.clone(),
+        workflow_store.clone(),
+        overrides.clone(),
+    )
+    .await?;
     tokio::spawn(run_terminal_dashboard(
         orchestrator.clone(),
+        config_store.clone(),
         workflow_store.clone(),
         overrides.clone(),
     ));
 
-    if let Some(port) = Settings::from_workflow(&workflow_store.current().await, &overrides)?
-        .server
-        .port
-    {
+    if let Some(port) = config_store.current_settings().await.server.port {
         tracing::info!("Starting HTTP server on port {port}");
         tokio::spawn(http::serve(
             orchestrator.clone(),
+            config_store.clone(),
             workflow_store.clone(),
             overrides.clone(),
         ));
@@ -86,8 +113,9 @@ async fn run() -> Result<()> {
 
 async fn run_terminal_dashboard(
     orchestrator: OrchestratorHandle,
-    workflow_store: WorkflowStore,
-    overrides: CliOverrides,
+    config_store: ConfigStore,
+    _workflow_store: WorkflowStore,
+    _overrides: CliOverrides,
 ) {
     let mut stdout = io::stdout();
     if !stdout.is_terminal() {
@@ -100,18 +128,9 @@ async fn run_terminal_dashboard(
     let mut token_samples: Vec<(u64, u64)> = Vec::new();
 
     loop {
-        let (settings, refresh_ms, render_interval_ms) =
-            match Settings::from_workflow(&workflow_store.current().await, &overrides) {
-                Ok(settings) => {
-                    let refresh_ms = settings.observability.refresh_ms;
-                    let render_interval_ms = settings.observability.render_interval_ms;
-                    (settings, refresh_ms, render_interval_ms)
-                }
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
-                    continue;
-                }
-            };
+        let settings = config_store.current_settings().await;
+        let refresh_ms = settings.observability.refresh_ms;
+        let render_interval_ms = settings.observability.render_interval_ms;
 
         if !settings.observability.dashboard_enabled {
             tokio::time::sleep(std::time::Duration::from_millis(refresh_ms.max(1))).await;
@@ -157,6 +176,75 @@ async fn run_terminal_dashboard(
 
         tokio::time::sleep(std::time::Duration::from_millis(refresh_ms.max(1))).await;
     }
+}
+
+fn run_validate(args: ValidateArgs, config_override: Option<PathBuf>) -> Result<()> {
+    let workflow_path = args
+        .workflow_path
+        .as_deref()
+        .map(|path| workflow_file_path(Some(path)))
+        .transpose()?;
+    let config_path = config_file_path(config_override.as_deref())?;
+    let overrides = CliOverrides::default();
+
+    match validate(&config_path, workflow_path.as_deref(), &overrides) {
+        Ok(output) => {
+            print_validate_output(&output, args.json)?;
+            Ok(())
+        }
+        Err(output) => {
+            print_validate_output(&output, args.json)?;
+            Err(anyhow!("config validation failed"))
+        }
+    }
+}
+
+fn print_validate_output(output: &ValidateOutput, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(output)?);
+        return Ok(());
+    }
+
+    if output.valid {
+        println!(
+            "Config valid: {} ({})",
+            output.config_path, output.config_format
+        );
+        if let Some(workflow_path) = &output.workflow_path {
+            println!("Workflow prompt readable: {workflow_path}");
+        }
+        for warning in &output.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "Configuration invalid in {} ({})",
+        output.config_path, output.config_format
+    );
+    for diagnostic in &output.diagnostics {
+        let mut location = String::new();
+        if let Some(line) = diagnostic.line {
+            if let Some(column) = diagnostic.column {
+                location = format!(" at {line}:{column}");
+            } else {
+                location = format!(" at line {line}");
+            }
+        }
+        if let Some(field_path) = &diagnostic.field_path {
+            println!(
+                "- {} [{}] ({}){}",
+                diagnostic.message, field_path, diagnostic.code, location
+            );
+        } else {
+            println!("- {} ({}){}", diagnostic.message, diagnostic.code, location);
+        }
+        if let Some(hint) = &diagnostic.hint {
+            println!("  hint: {hint}");
+        }
+    }
+    Ok(())
 }
 
 const ANSI_BOLD: &str = "\x1b[1m";
@@ -475,22 +563,22 @@ mod tests {
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
     use rsymphony::status_dashboard::format_snapshot_content_for_test;
-    use rsymphony::workflow::LoadedWorkflow;
     use serde_json::json;
+    use tempfile::tempdir;
 
     fn settings() -> Settings {
-        Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  project_slug: demo\nserver:\n  port: 4000\n",
-                )
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join(".symphony.toml");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(
+            &config_path,
+            "[tracker]\nkind = \"memory\"\nproject_slug = \"demo\"\n[server]\nport = 4000\n",
         )
-        .unwrap()
+        .unwrap();
+        std::fs::write(&workflow_path, "Prompt body\n").unwrap();
+        Settings::load(&config_path, Some(&workflow_path), &CliOverrides::default())
+            .unwrap()
+            .settings
     }
 
     fn snapshot() -> Snapshot {
@@ -558,6 +646,44 @@ mod tests {
     fn accepts_yolo_alias_for_guardrail_acknowledgement() {
         let args = Args::try_parse_from(["rsymphony", "--yolo"]).unwrap();
         assert!(args.acknowledge_guardrails);
+    }
+
+    #[test]
+    fn parses_validate_subcommand_with_config_override() {
+        let args = Args::try_parse_from([
+            "rsymphony",
+            "--config",
+            "/tmp/.symphony.toml",
+            "validate",
+            "/tmp/WORKFLOW.md",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.config_path.as_deref(),
+            Some(Path::new("/tmp/.symphony.toml"))
+        );
+        match args.command {
+            Some(Command::Validate(validate)) => {
+                assert_eq!(
+                    validate.workflow_path.as_deref(),
+                    Some(Path::new("/tmp/WORKFLOW.md"))
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_subcommand_and_json_flag() {
+        let args =
+            Args::try_parse_from(["rsymphony", "--config", "custom.toml", "validate", "--json"])
+                .unwrap();
+        assert_eq!(args.config_path, Some(PathBuf::from("custom.toml")));
+        match args.command {
+            Some(Command::Validate(validate)) => assert!(validate.json),
+            _ => panic!("expected validate subcommand"),
+        }
     }
 
     #[test]

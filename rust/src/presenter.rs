@@ -430,20 +430,11 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
+    use crate::config::{Settings, settings_from_toml_str};
     use crate::orchestrator::{PollingSnapshot, TokenTotals};
-    use crate::workflow::LoadedWorkflow;
 
     fn settings() -> Settings {
-        Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str("tracker:\n  kind: memory\n").unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap()
+        settings_from_toml_str("[tracker]\nkind = \"memory\"\n")
     }
 
     fn snapshot() -> Snapshot {

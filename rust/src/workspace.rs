@@ -316,23 +316,13 @@ async fn ensure_remote_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
-    use crate::workflow::LoadedWorkflow;
+    use crate::config::{Settings, settings_from_toml_str};
 
     fn settings(root: &Path) -> Settings {
-        Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str(&format!(
-                    "tracker:\n  kind: memory\nworkspace:\n  root: {}\n",
-                    root.display()
-                ))
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap()
+        settings_from_toml_str(&format!(
+            "[tracker]\nkind = \"memory\"\n[workspace]\nroot = \"{}\"\n",
+            root.display()
+        ))
     }
 
     #[tokio::test]

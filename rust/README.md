@@ -30,12 +30,12 @@ matching workspaces.
    [Harness engineering](https://openai.com/index/harness-engineering/).
 2. Get a new personal token in Linear via Settings → Security & access →
    Personal API keys, and set it as the `LINEAR_API_KEY` environment variable.
-3. Copy this directory's `WORKFLOW.md` to your repo.
+3. Copy this directory's `.symphony.toml` and `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to
    your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for
      raw Linear GraphQL operations such as comment editing or upload flows.
-5. Customize the copied `WORKFLOW.md` file for your project.
+5. Customize `.symphony.toml` for runtime behavior and `WORKFLOW.md` for agent instructions.
 6. Install the Rust toolchain and run the commands below.
 
 ## Prerequisites
@@ -71,17 +71,24 @@ cd symphony/rust
 cargo build --release --bin rsymphony
 ./target/release/rsymphony \
   --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --config ./.symphony.toml \
   ./WORKFLOW.md
 ```
 
 You can also use the local task runner:
 
 ```bash
-just run ./WORKFLOW.md
+just run ./WORKFLOW.md ./.symphony.toml
 ```
 
 The terminal dashboard renders automatically in a local TTY by default. Start
 the web dashboard explicitly with `--port` when you want the browser UI.
+
+Validate config without starting the service:
+
+```bash
+just validate
+```
 
 ## Install
 
@@ -139,10 +146,11 @@ Pass a custom workflow file path to `rsymphony` when starting the service:
 ```bash
 rsymphony \
   --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --config /path/to/.symphony.toml \
   /path/to/custom/WORKFLOW.md
 ```
 
-If no path is passed, Symphony defaults to `./WORKFLOW.md`.
+If no paths are passed, Symphony defaults to `./.symphony.toml` and `./WORKFLOW.md`.
 
 Optional flags:
 
@@ -150,30 +158,36 @@ Optional flags:
   (default: `./log`)
 - `--port` also enables the web dashboard and API endpoints on that port
   (terminal observability remains on by default when attached to a TTY)
+- `validate` checks config and prints clear errors; add `--json` for machine-readable output
 
-The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown
-body used as the Codex session prompt.
+`.symphony.toml` contains machine-validated runtime config. `WORKFLOW.md` is the
+Codex session prompt only.
 
 Minimal example:
 
-```md
----
-tracker:
-  kind: linear
-  workspace_slug: "..."
-  project_slug: "..."
-workspace:
-  root: ~/code/workspaces
-hooks:
-  after_create: |
-    git clone git@github.com:your-org/your-repo.git .
-agent:
-  max_concurrent_agents: 10
-  max_turns: 20
-codex:
-  command: codex app-server
----
+```toml
+[tracker]
+kind = "linear"
+workspace_slug = "..."
+project_slug = "..."
 
+[workspace]
+root = "~/code/workspaces"
+
+[hooks]
+after_create = """
+git clone git@github.com:your-org/your-repo.git .
+"""
+
+[agent]
+max_concurrent_agents = 10
+max_turns = 20
+
+[codex]
+command = "codex app-server"
+```
+
+```md
 You are working on a Linear issue {{ issue.identifier }}.
 
 Title: {{ issue.title }} Body: {{ issue.description }}
@@ -192,10 +206,12 @@ Notes:
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR`
   before path handling, while `codex.command` stays a shell command string and
   any `$VAR` expansion there happens in the launched shell.
-- If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not
-  boot.
-- If a later reload fails, Symphony keeps running with the last known good
-  workflow and logs the reload error until the file is fixed.
+- If `.symphony.toml` is missing, Symphony falls back to legacy `WORKFLOW.md`
+  front matter for one release and prints a deprecation warning.
+- If startup config is invalid, Symphony does not boot and prints all detected
+  config errors.
+- If a later config or prompt reload fails, Symphony keeps running with the last
+  known good version and logs the reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 - If the terminal dashboard looks wrong, confirm you are running in a real TTY
@@ -209,7 +225,8 @@ Notes:
 - `src/`: runtime code
 - `Cargo.toml`: crate and binary definitions
 - `justfile`: local development and install commands
-- `WORKFLOW.md`: in-repo workflow contract used by local runs
+- `.symphony.toml`: in-repo runtime configuration
+- `WORKFLOW.md`: prompt contract used by local runs
 - `../.codex/`: repository-local Codex skills and setup helpers
 
 ## Testing

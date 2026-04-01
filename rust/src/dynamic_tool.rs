@@ -64,7 +64,7 @@ async fn execute_linear_graphql(arguments: JsonValue, settings: &Settings) -> Js
                     if message.contains("missing_linear_api_token") {
                         failure_response(json!({
                             "error": {
-                                "message": "Symphony is missing Linear auth. Set `linear.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
+                                "message": "Symphony is missing Linear auth. Set `tracker.api_key` in `.symphony.toml` or export `LINEAR_API_KEY`."
                             }
                         }))
                     } else if let Some(status) = message.strip_prefix("linear_api_status: ") {
@@ -162,8 +162,7 @@ fn failure_response(payload: JsonValue) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
-    use crate::workflow::LoadedWorkflow;
+    use crate::config::settings_from_toml_str;
 
     #[tokio::test]
     async fn tool_specs_advertises_contract() {
@@ -173,15 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_arguments_return_failure() {
-        let settings = Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str("tracker:\n  kind: memory\n").unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
-        )
-        .unwrap();
+        let settings = settings_from_toml_str("[tracker]\nkind = \"memory\"\n");
 
         let payload = execute(Some(LINEAR_GRAPHQL_TOOL), json!(["bad"]), &settings).await;
         assert_eq!(payload["success"], false);

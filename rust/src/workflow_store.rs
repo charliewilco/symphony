@@ -81,7 +81,7 @@ impl WorkflowStore {
             loop {
                 interval.tick().await;
                 if let Err(error) = store.maybe_reload().await {
-                    tracing::error!("Failed to reload workflow: {error}");
+                    tracing::error!("Failed to reload workflow prompt: {error}");
                 }
             }
         });

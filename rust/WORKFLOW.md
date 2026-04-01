@@ -1,38 +1,3 @@
----
-tracker:
-  kind: linear
-  workspace_slug: "weaveteam"
-  project_slug: "symphony-0c79b11b75ea"
-  active_states:
-    - Todo
-    - In Progress
-    - Merging
-    - Rework
-  terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
-    - Done
-polling:
-  interval_ms: 5000
-workspace:
-  root: ~/code/symphony-workspaces
-hooks:
-  after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
-    cd rust && cargo fetch
-agent:
-  max_concurrent_agents: 10
-  max_turns: 20
-codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
----
-
 You are working on a Linear ticket `{{ issue.identifier }}`
 
 {% if attempt %}

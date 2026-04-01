@@ -22,8 +22,11 @@ build:
 
 alias b := build
 
-run workflow="./WORKFLOW.md":
-    cargo run --bin rsymphony -- --i-understand-that-this-will-be-running-without-the-usual-guardrails {{workflow}}
+run workflow="./WORKFLOW.md" config="./.symphony.toml":
+    cargo run --bin rsymphony -- --i-understand-that-this-will-be-running-without-the-usual-guardrails --config {{config}} {{workflow}}
+
+validate workflow="./WORKFLOW.md" config="./.symphony.toml":
+    cargo run --bin rsymphony -- --config {{config}} validate {{workflow}}
 
 install:
     cargo install --path . --bin rsymphony --force

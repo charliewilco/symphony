@@ -1046,27 +1046,17 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
+    use crate::config::{Settings, settings_from_toml_str};
     use crate::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
-    use crate::workflow::LoadedWorkflow;
     use chrono::Utc;
     use serde_json::json;
 
     fn settings() -> Settings {
-        Settings::from_workflow(
-            &LoadedWorkflow {
-                config: serde_yaml::from_str(
-                    "tracker:\n  kind: memory\n  workspace_slug: weaveteam\n  project_slug: demo\nserver:\n  port: 4000\n",
-                )
-                .unwrap(),
-                prompt_template: String::new(),
-                prompt: String::new(),
-            },
-            &CliOverrides::default(),
+        settings_from_toml_str(
+            "[tracker]\nkind = \"memory\"\nworkspace_slug = \"weaveteam\"\nproject_slug = \"demo\"\n[server]\nport = 4000\n",
         )
-        .unwrap()
     }
 
     fn snapshot() -> Snapshot {

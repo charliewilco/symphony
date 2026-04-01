@@ -774,9 +774,8 @@ fn truncate_text(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CliOverrides, Settings};
+    use crate::config::{Settings, settings_from_toml_str};
     use crate::tracker::Issue;
-    use crate::workflow::parse;
     use serde_json::json;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -790,17 +789,15 @@ mod tests {
         command: &str,
         approval_policy: Option<&str>,
     ) -> Settings {
-        let mut workflow_source = format!(
-            "---\ntracker:\n  kind: memory\nworkspace:\n  root: {}\ncodex:\n  command: '{}'\n",
+        let mut config = format!(
+            "[tracker]\nkind = \"memory\"\n[workspace]\nroot = \"{}\"\n[codex]\ncommand = '{}'\n",
             workspace_root.display(),
             command.replace('\'', "'\"'\"'")
         );
         if let Some(policy) = approval_policy {
-            workflow_source.push_str(&format!("  approval_policy: {policy}\n"));
+            config.push_str(&format!("approval_policy = \"{policy}\"\n"));
         }
-        workflow_source.push_str("---\n");
-        let workflow = parse(&workflow_source).unwrap();
-        Settings::from_workflow(&workflow, &CliOverrides::default()).unwrap()
+        settings_from_toml_str(&config)
     }
 
     fn issue() -> Issue {

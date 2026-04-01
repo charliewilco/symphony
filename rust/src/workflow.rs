@@ -1,12 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde_yaml::{Mapping, Value};
 
 #[derive(Clone, Debug)]
 pub struct LoadedWorkflow {
-    pub config: Value,
     pub prompt_template: String,
     pub prompt: String,
 }
@@ -25,14 +24,29 @@ pub fn load(path: &Path) -> Result<LoadedWorkflow> {
 }
 
 pub fn parse(content: &str) -> Result<LoadedWorkflow> {
-    let (front_matter_lines, prompt_lines) = split_front_matter(content);
-    let config = front_matter_to_value(&front_matter_lines)?;
+    let (_, prompt_lines) = split_front_matter(content);
     let prompt = prompt_lines.join("\n").trim().to_string();
     Ok(LoadedWorkflow {
-        config,
         prompt_template: prompt.clone(),
         prompt,
     })
+}
+
+pub fn load_legacy_front_matter(path: &Path) -> Result<Value> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| anyhow!("missing_workflow_file: {}: {error}", path.display()))?;
+    parse_legacy_front_matter(&content)
+}
+
+pub fn parse_legacy_front_matter(content: &str) -> Result<Value> {
+    let (front_matter_lines, _) = split_front_matter(content);
+    front_matter_to_value(&front_matter_lines)
+}
+
+pub fn has_front_matter(path: &Path) -> Result<bool> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| anyhow!("missing_workflow_file: {}: {error}", path.display()))?;
+    Ok(matches!(content.lines().next(), Some("---")))
 }
 
 fn split_front_matter(content: &str) -> (Vec<String>, Vec<String>) {
@@ -71,7 +85,7 @@ fn front_matter_to_value(lines: &[String]) -> Result<Value> {
         serde_yaml::from_str(&yaml).map_err(|error| anyhow!("workflow_parse_error: {error}"))?;
     match value {
         Value::Mapping(_) => Ok(value),
-        _ => bail!("workflow_front_matter_not_a_map"),
+        _ => Err(anyhow!("workflow_front_matter_not_a_map")),
     }
 }
 
@@ -83,13 +97,26 @@ mod tests {
     fn parses_prompt_only_workflow() {
         let workflow = parse("Prompt only\n").unwrap();
         assert_eq!(workflow.prompt, "Prompt only");
-        assert!(matches!(workflow.config, Value::Mapping(_)));
     }
 
     #[test]
-    fn parses_unterminated_front_matter() {
-        let workflow = parse("---\ntracker:\n  kind: linear\n").unwrap();
-        assert_eq!(workflow.prompt, "");
-        assert!(matches!(workflow.config, Value::Mapping(_)));
+    fn strips_front_matter_without_parsing_it() {
+        let workflow = parse("---\nnot: [valid\n---\nPrompt body\n").unwrap();
+        assert_eq!(workflow.prompt, "Prompt body");
+    }
+
+    #[test]
+    fn parses_legacy_front_matter_when_requested() {
+        let value =
+            parse_legacy_front_matter("---\ntracker:\n  kind: linear\n---\nPrompt\n").unwrap();
+        assert_eq!(value["tracker"]["kind"], "linear");
+    }
+
+    #[test]
+    fn detects_front_matter_from_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("WORKFLOW.md");
+        std::fs::write(&path, "---\ntracker:\n  kind: memory\n---\nPrompt\n").unwrap();
+        assert!(has_front_matter(&path).unwrap());
     }
 }
