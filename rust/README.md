@@ -141,6 +141,8 @@ cargo uninstall rsymphony
 
 ## Configuration
 
+For a command-oriented reference, see [`CLI.md`](./CLI.md).
+
 Pass a custom workflow file path to `rsymphony` when starting the service:
 
 ```bash
