@@ -673,7 +673,7 @@ async fn snapshot_with_timeout(state: &HttpState) -> std::result::Result<Snapsho
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use serde_json::Value as JsonValue;
     use tokio::time::sleep;
@@ -776,6 +776,17 @@ mod tests {
                 poll_interval_ms: 30_000,
             },
         }
+    }
+
+    fn assert_terminal_contract_fragments(body: &str) {
+        assert!(body.contains("SYMPHONY STATUS"));
+        assert!(body.contains("ID"));
+        assert!(body.contains("STAGE"));
+        assert!(body.contains("AGE / TURN"));
+        assert!(body.contains("TOKENS"));
+        assert!(body.contains("SESSION"));
+        assert!(body.contains("EVENT"));
+        assert!(body.contains("Backoff queue"));
     }
 
     #[tokio::test]
@@ -900,6 +911,19 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
+        let unavailable_dashboard = unavailable_app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unavailable_dashboard.status(), StatusCode::OK);
+        let unavailable_dashboard_body =
+            to_bytes(unavailable_dashboard.into_body(), usize::MAX).await.unwrap();
+        let unavailable_dashboard_body =
+            String::from_utf8(unavailable_dashboard_body.to_vec()).unwrap();
+        assert!(unavailable_dashboard_body.contains("snapshot_unavailable"));
+        assert!(unavailable_dashboard_body.contains("Symphony"));
+
         let timeout_response = timeout_app
             .oneshot(
                 Request::builder()
@@ -928,7 +952,6 @@ mod tests {
         let app = router(state);
 
         for path in [
-            "/",
             "/dashboard.css",
             "/vendor/phoenix_html/phoenix_html.js",
             "/vendor/phoenix/phoenix.js",
@@ -941,6 +964,18 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
+
+        let dashboard_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dashboard_response.status(), StatusCode::OK, "/");
+        let dashboard_body = to_bytes(dashboard_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dashboard_body = String::from_utf8(dashboard_body.to_vec()).unwrap();
+        assert_terminal_contract_fragments(&dashboard_body);
     }
 
     #[tokio::test]

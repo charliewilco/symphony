@@ -498,9 +498,15 @@ mod tests {
         assert!(html.contains("/vendor/phoenix_html/phoenix_html.js"));
         assert!(html.contains("terminal-dashboard"));
         assert!(html.contains("SYMPHONY STATUS"));
+        assert!(html.contains("ID"));
+        assert!(html.contains("STAGE"));
+        assert!(html.contains("AGE / TURN"));
+        assert!(html.contains("TOKENS"));
+        assert!(html.contains("SESSION"));
+        assert!(html.contains("EVENT"));
         assert!(html.contains("hero-card"));
         assert!(html.contains("metric-card"));
         assert!(html.contains("data-table-running"));
-        assert!(html.contains("Retry queue"));
+        assert!(html.contains("Backoff queue"));
     }
 }
