@@ -1050,7 +1050,7 @@ mod tests {
     use crate::orchestrator::{
         PollingSnapshot, RetrySnapshot, RunningSnapshot, Snapshot, TokenTotals,
     };
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
 
     fn settings() -> Settings {
@@ -1061,28 +1061,56 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         Snapshot {
-            running: vec![RunningSnapshot {
-                issue_id: "issue-1".to_string(),
-                identifier: "MT-101".to_string(),
-                state: "In Progress".to_string(),
-                worker_host: None,
-                workspace_path: None,
-                session_id: Some("thread-1-turn-1".to_string()),
-                codex_app_server_pid: Some("4242".to_string()),
-                codex_input_tokens: 100,
-                codex_output_tokens: 25,
-                codex_total_tokens: 125,
-                turn_count: 3,
-                started_at: Utc::now(),
-                last_codex_timestamp: None,
-                last_codex_message: Some(json!({
-                    "event": "approval_auto_approved",
-                    "message": { "method": "item/commandExecution/requestApproval" },
-                    "decision": "acceptForSession"
-                })),
-                last_codex_event: Some("approval_auto_approved".to_string()),
-                runtime_seconds: 90,
-            }],
+            running: vec![
+                RunningSnapshot {
+                    issue_id: "issue-1".to_string(),
+                    identifier: "MT-101".to_string(),
+                    state: "In Progress".to_string(),
+                    worker_host: None,
+                    workspace_path: None,
+                    session_id: Some("thread-1-turn-1".to_string()),
+                    codex_app_server_pid: Some("4242".to_string()),
+                    codex_input_tokens: 100,
+                    codex_output_tokens: 25,
+                    codex_total_tokens: 125,
+                    turn_count: 3,
+                    started_at: Utc
+                        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                        .single()
+                        .expect("valid timestamp"),
+                    last_codex_timestamp: None,
+                    last_codex_message: Some(json!({
+                        "event": "approval_auto_approved",
+                        "message": { "method": "item/commandExecution/requestApproval" },
+                        "decision": "acceptForSession"
+                    })),
+                    last_codex_event: Some("approval_auto_approved".to_string()),
+                    runtime_seconds: 90,
+                },
+                RunningSnapshot {
+                    issue_id: "issue-3".to_string(),
+                    identifier: "MT-150".to_string(),
+                    state: "Todo".to_string(),
+                    worker_host: None,
+                    workspace_path: None,
+                    session_id: Some("thread-2-turn-9".to_string()),
+                    codex_app_server_pid: Some("5252".to_string()),
+                    codex_input_tokens: 150,
+                    codex_output_tokens: 75,
+                    codex_total_tokens: 225,
+                    turn_count: 9,
+                    started_at: Utc
+                        .with_ymd_and_hms(2026, 1, 1, 0, 5, 0)
+                        .single()
+                        .expect("valid timestamp"),
+                    last_codex_timestamp: None,
+                    last_codex_message: Some(json!({
+                        "event": "turn_input_required"
+                    })),
+                    last_codex_event: Some("turn_input_required".to_string()),
+                    runtime_seconds: 540,
+                },
+            ],
             retrying: vec![RetrySnapshot {
                 issue_id: "issue-2".to_string(),
                 attempt: 2,
@@ -1109,6 +1137,15 @@ mod tests {
                 poll_interval_ms: 30_000,
             },
         }
+    }
+
+    fn normalize_for_assertion(content: &str) -> String {
+        content
+            .replace("\r\n", "\n")
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1147,22 +1184,64 @@ mod tests {
     }
 
     #[test]
-    fn formats_snapshot_content_with_running_and_retry_rows() {
+    fn formats_snapshot_content_shape_with_running_and_backoff_rows() {
         let rendered =
             format_snapshot_content_for_test(Some(&snapshot()), &settings(), 658_875.2, Some(115));
-        assert!(rendered.contains("SYMPHONY STATUS"));
-        assert!(rendered.contains("ID       STAGE"));
-        assert!(rendered.contains("AGE / TURN"));
-        assert!(rendered.contains("SESSION"));
-        assert!(rendered.contains("MT-101"));
-        assert!(rendered.contains("MT-202"));
-        assert!(rendered.contains("approval"));
-        assert!(rendered.contains("error=error with newline"));
-        assert!(rendered.contains("Throughput: 658,875 tps"));
-        assert!(rendered.contains("https://linear.app/weaveteam/project/demo/issues"));
-        assert!(rendered.contains("http://127.0.0.1:4000/"));
-        assert!(rendered.contains("1m 30s / 3"));
-        assert!(rendered.contains("thread-1-turn-1") || rendered.contains("thre...turn-1"));
+        let rendered = normalize_for_assertion(&rendered);
+        let expected = r#"╭─ SYMPHONY STATUS
+├─ Status
+│
+│ Agents: 2/10                          Throughput: 658,875 tps               Runtime: 1m 30s
+│ Tokens: in 100 | out 25 | total 125   Rate Limits: gpt-5 | primary 10/20... Next refresh: 5s
+│ Project: https://linear.app/weaveteam/project/demo/issues
+│ Dashboard: http://127.0.0.1:4000/
+│
+├─ Running
+│
+│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT
+│   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│ ● MT-101   In Progress    4242     1m 30s / 3          125 thre...turn-1  command approval requested (auto-approved...
+│ ● MT-150   Todo           5252     9m 0s / 9           225 thre...turn-9  turn blocked: waiting for user input
+│
+├─ Backoff queue
+│
+│  ↻ MT-202 attempt=2 in 1.500s error=error with newline
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────"#;
+        assert_eq!(rendered, normalize_for_assertion(expected));
+    }
+
+    #[test]
+    fn formats_snapshot_content_shape_with_empty_backoff_queue() {
+        let mut deterministic = snapshot();
+        deterministic.retrying.clear();
+
+        let rendered = format_snapshot_content_for_test(
+            Some(&deterministic),
+            &settings(),
+            658_875.2,
+            Some(115),
+        );
+        let rendered = normalize_for_assertion(&rendered);
+        let expected = r#"╭─ SYMPHONY STATUS
+├─ Status
+│
+│ Agents: 2/10                          Throughput: 658,875 tps               Runtime: 1m 30s
+│ Tokens: in 100 | out 25 | total 125   Rate Limits: gpt-5 | primary 10/20... Next refresh: 5s
+│ Project: https://linear.app/weaveteam/project/demo/issues
+│ Dashboard: http://127.0.0.1:4000/
+│
+├─ Running
+│
+│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT
+│   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│ ● MT-101   In Progress    4242     1m 30s / 3          125 thre...turn-1  command approval requested (auto-approved...
+│ ● MT-150   Todo           5252     9m 0s / 9           225 thre...turn-9  turn blocked: waiting for user input
+│
+├─ Backoff queue
+│
+│  No queued retries
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────"#;
+        assert_eq!(rendered, normalize_for_assertion(expected));
     }
 
     #[test]
