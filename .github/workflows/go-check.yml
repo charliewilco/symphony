@@ -1,0 +1,37 @@
+name: go-check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/go-check.yml"
+      - "go/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/go-check.yml"
+      - "go/**"
+
+jobs:
+  go-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: true
+          cache-dependency-path: go/go.sum
+
+      - name: Run Go checks
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+          go test ./...
