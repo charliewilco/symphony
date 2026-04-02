@@ -1111,6 +1111,21 @@ mod tests {
         }
     }
 
+    fn assert_semantic_snapshot_parity(text: &str, html: &str) {
+        for semantic_token in [
+            "MT-101",
+            "MT-202",
+            "Running",
+            "Backoff queue",
+            "approval",
+            "https://linear.app/weaveteam/project/demo/issues",
+            "http://127.0.0.1:4000/",
+        ] {
+            assert!(text.contains(semantic_token), "text missing {semantic_token}");
+            assert!(html.contains(semantic_token), "html missing {semantic_token}");
+        }
+    }
+
     #[test]
     fn humanizes_key_codex_messages() {
         assert_eq!(humanize_codex_message(None), "no codex message yet");
@@ -1175,5 +1190,42 @@ mod tests {
         assert!(rendered.contains("term-cyan"));
         assert!(rendered.contains("MT-101"));
         assert!(rendered.contains("Backoff queue"));
+    }
+
+    #[test]
+    fn keeps_semantic_content_in_sync_between_text_and_html_renderers() {
+        let snapshot = snapshot();
+        let configured_settings = settings();
+        let text = format_snapshot_content_for_test(
+            Some(&snapshot),
+            &configured_settings,
+            658_875.2,
+            Some(115),
+        );
+        let html = render_snapshot_html_for_test(
+            Some(&snapshot),
+            &configured_settings,
+            658_875.2,
+            Some(115),
+        );
+
+        assert_semantic_snapshot_parity(&text, &html);
+
+        assert!(html.contains("term-strong"));
+        assert!(html.contains("term-green"));
+        assert!(html.contains("term-yellow"));
+        assert!(html.contains("term-cyan"));
+    }
+
+    #[test]
+    fn keeps_snapshot_unavailable_content_in_sync_between_text_and_html_renderers() {
+        let configured_settings = settings();
+        let text = format_snapshot_content_for_test(None, &configured_settings, 0.0, Some(115));
+        let html = render_snapshot_html_for_test(None, &configured_settings, 0.0, Some(115));
+
+        assert!(text.contains("Orchestrator snapshot unavailable"));
+        assert!(html.contains("Orchestrator snapshot unavailable"));
+        assert!(text.contains("Status unknown"));
+        assert!(html.contains("n/a"));
     }
 }
