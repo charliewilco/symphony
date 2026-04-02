@@ -1,0 +1,30 @@
+default: check
+
+check: fmt-check vet test
+
+fmt:
+    go fmt ./...
+
+fmt-check:
+    @test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+vet:
+    go vet ./...
+
+test:
+    go test ./...
+
+build:
+    go build -o bin/gsymphony ./cmd/gsymphony
+
+run *ARGS:
+    go run ./cmd/gsymphony {{ARGS}}
+
+validate *ARGS:
+    go run ./cmd/gsymphony validate {{ARGS}}
+
+install:
+    go install ./cmd/gsymphony
+
+b: build
+i: install
